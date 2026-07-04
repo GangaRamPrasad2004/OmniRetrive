@@ -36,9 +36,9 @@ st.divider()
 st.title("Ask a question about your PDFs")
 
 
-INNGEST_EVENT_KEY = os.getenv("INNGEST_EVENT_KEY", "")
-INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "")
-INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
+INNGEST_EVENT_KEY = os.getenv("INNGEST_EVENT_KEY", "").strip()
+INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "").strip()
+INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1").strip()
 
 
 def send_rag_query_event(question: str, top_k: int) -> str:
