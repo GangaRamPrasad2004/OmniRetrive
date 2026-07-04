@@ -1,0 +1,45 @@
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM python:3.13-slim AS builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpoppler-cpp-dev \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Copy dependency files first (better layer caching)
+COPY pyproject.toml uv.lock ./
+
+# Create venv and install deps (no dev deps, frozen to lockfile)
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+RUN uv sync --frozen --no-dev --no-install-project
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM python:3.13-slim AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the venv built in the builder stage
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy only the files the frontend needs
+COPY frontend.py ./
+COPY .streamlit/ ./.streamlit/
+
+RUN mkdir -p /app/uploads
+
+# Streamlit default port
+ENV PORT=8501
+EXPOSE 8501
+
+CMD ["sh", "-c", "streamlit run frontend.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true"]

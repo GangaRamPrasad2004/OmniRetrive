@@ -14,10 +14,14 @@ from custom_types import RAGChunksAndSrc,RAGQueryResult,RAGUpsertResult,RAGSearc
 load_dotenv()
 
 
+# In production (Sevalla) set IS_PRODUCTION=true as an env var.
+# Locally leave it unset or set to false — dev server handles routing.
+_is_production = os.getenv("IS_PRODUCTION", "false").lower() == "true"
+
 inngest_client=inngest.Inngest(
     app_id="rag_app",
     logger=logging.getLogger("uvicorn"),
-    is_production=False,
+    is_production=_is_production,
     serializer=inngest.PydanticSerializer()
 )
 @inngest_client.create_function(
@@ -46,7 +50,11 @@ async def rag_ingest_pdf(ctx:inngest.Context):
       vecs = embed_texts(chunks)
       ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(chunks))]
       payloads = [{"source": source_id, "text": chunks[i]} for i in range(len(chunks))]
-      QdrantStorage(collection="docs_hf").upsert(ids, vecs, payloads)
+      QdrantStorage(
+            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            api_key=os.getenv("QDRANT_API_KEY"),
+            collection="docs_hf"
+         ).upsert(ids, vecs, payloads)
       return RAGUpsertResult(ingested=len(chunks))
    
 
@@ -62,7 +70,11 @@ async def rag_ingest_pdf(ctx:inngest.Context):
 async def rag_query_pdf_ai(ctx: inngest.Context):
     def _search(question: str, top_k: int = 5) -> RAGSearchResult:
         query_vec = embed_texts([question])[0]
-        store = QdrantStorage(collection="docs_hf")
+        store = QdrantStorage(
+            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            api_key=os.getenv("QDRANT_API_KEY"),
+            collection="docs_hf"
+        )
         found = store.search(query_vec, top_k)
         return RAGSearchResult(contexts=found["contexts"], sources=found["sources"])
 

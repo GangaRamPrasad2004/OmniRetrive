@@ -15,7 +15,8 @@ st.set_page_config(page_title="OmniRetrive", layout="centered")
 
 @st.cache_resource
 def get_inngest_client() -> inngest.Inngest:
-    return inngest.Inngest(app_id="rag_app", is_production=False)
+    is_prod = os.getenv("IS_PRODUCTION", "false").lower() == "true"
+    return inngest.Inngest(app_id="rag_app", is_production=is_prod)
 
 
 def save_uploaded_pdf(file) -> Path:
@@ -73,7 +74,8 @@ async def send_rag_query_event(question: str, top_k: int) -> None:
 
 
 def _inngest_api_base() -> str:
-    # Local dev server default; configurable via env
+    # In production this should point to the Inngest Cloud REST API.
+    # Locally it points to the Inngest Dev Server.
     return os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
 
 

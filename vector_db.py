@@ -3,8 +3,8 @@ from qdrant_client.models import VectorParams,Distance,PointStruct
 
 
 class QdrantStorage:
-    def __init__(self,url="http://localhost:6333",collection="docs_hf",dim=768):
-        self.client=QdrantClient(url=url, timeout=30)
+    def __init__(self, url="http://localhost:6333", collection="docs_hf", dim=768, api_key=None):
+        self.client = QdrantClient(url=url, api_key=api_key, timeout=30)
         self.collection=collection
         if not self.client.collection_exists(self.collection):
             self.client.create_collection(

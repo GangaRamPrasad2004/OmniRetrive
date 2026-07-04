@@ -8,4 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
-.env 
+.env
+
+# Runtime data (never commit uploads or local vector DB)
+uploads/
+qdrant_storage/
