@@ -34,7 +34,6 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy only the files the frontend needs
 COPY frontend.py ./
-COPY .streamlit/ ./.streamlit/
 
 RUN mkdir -p /app/uploads
 
