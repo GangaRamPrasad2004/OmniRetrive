@@ -36,15 +36,20 @@ st.divider()
 st.title("Ask a question about your PDFs")
 
 
-def _inngest_api_base() -> str:
-    # In production this should point to the Inngest Cloud REST API.
-    # Locally it points to the Inngest Dev Server.
-    return os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
+INNGEST_EVENT_KEY = os.getenv("INNGEST_EVENT_KEY", "")
+INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "")
+INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1")
 
 
 def send_rag_query_event(question: str, top_k: int) -> str:
-    """Send the query event via the Inngest REST API and return the event ID."""
-    url = f"{_inngest_api_base()}/e/rag_app"
+    """Send the query event to Inngest and return the event ID."""
+    # In production, use the Inngest Cloud event ingestion endpoint
+    # Locally, use the dev server
+    if INNGEST_EVENT_KEY:
+        url = f"https://inn.gs/e/{INNGEST_EVENT_KEY}"
+    else:
+        url = f"{INNGEST_API_BASE}/e/rag_app"
+
     resp = requests.post(
         url,
         json={
@@ -58,14 +63,16 @@ def send_rag_query_event(question: str, top_k: int) -> str:
     )
     resp.raise_for_status()
     data = resp.json()
-    # Inngest REST API returns {"ids": ["..."]} or {"status": 200, ...}
     ids = data.get("ids", [])
     return ids[0] if ids else data.get("id", "")
 
 
 def fetch_runs(event_id: str) -> list[dict]:
-    url = f"{_inngest_api_base()}/events/{event_id}/runs"
-    resp = requests.get(url)
+    url = f"{INNGEST_API_BASE}/events/{event_id}/runs"
+    headers = {}
+    if INNGEST_SIGNING_KEY:
+        headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
+    resp = requests.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()
     return data.get("data", [])
