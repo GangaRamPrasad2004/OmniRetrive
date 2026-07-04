@@ -1,5 +1,6 @@
 import logging
-from fastapi import FastAPI
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File
 import inngest
 from inngest.experimental import ai
 import inngest.fast_api
@@ -13,6 +14,8 @@ from custom_types import RAGChunksAndSrc,RAGQueryResult,RAGUpsertResult,RAGSearc
 
 load_dotenv()
 
+UPLOADS_DIR = Path("/app/uploads")
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # In production (Sevalla) set IS_PRODUCTION=true as an env var.
 # Locally leave it unset or set to false — dev server handles routing.
@@ -115,8 +118,41 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
 
 app=FastAPI()
 
+# Allow the Streamlit frontend (running on a different origin) to call the backend
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 inngest.fast_api.serve(
     app,
     inngest_client,
     [rag_ingest_pdf,rag_query_pdf_ai],
 )
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/upload")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Accept a PDF from the frontend, save it locally, and fire the Inngest ingest event."""
+    dest = UPLOADS_DIR / file.filename
+    contents = await file.read()
+    dest.write_bytes(contents)
+
+    client = inngest_client
+    event = inngest.Event(
+        name="rag/ingest_pdf",
+        data={
+            "pdf_path": str(dest),
+            "source_id": file.filename,
+        },
+    )
+    ids = await client.send(event)
+    return {"event_id": ids[0], "filename": file.filename}
