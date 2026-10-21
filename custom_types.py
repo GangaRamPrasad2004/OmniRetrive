@@ -1,5 +1,16 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import pydantic
+
+
+class CitationItem(pydantic.BaseModel):
+    document_name: str
+    document_id: str
+    page_number: int
+    chunk_index: int
+    relevant_text: str
+    score: float = 0.0
+    heading: Optional[str] = None
+    verified: bool = True
 
 
 class RAGChunksAndSrc(pydantic.BaseModel):
@@ -8,6 +19,7 @@ class RAGChunksAndSrc(pydantic.BaseModel):
     document_id: Optional[str] = None
     workspace_id: Optional[str] = "default_workspace"
     page_count: Optional[int] = 0
+    chunk_metadata: Optional[List[Dict[str, Any]]] = None
 
 
 class RAGUpsertResult(pydantic.BaseModel):
@@ -19,12 +31,17 @@ class RAGUpsertResult(pydantic.BaseModel):
 class RAGSearchResult(pydantic.BaseModel):
     contexts: List[str]
     sources: List[str]
+    citations: Optional[List[CitationItem]] = None
 
 
 class RAGQueryResult(pydantic.BaseModel):
     answer: str
     sources: List[str]
+    citations: List[CitationItem] = []
     num_contexts: int
+    grounded: bool = True
+    insufficient_context: bool = False
+    workspace_id: Optional[str] = None
 
 
 class DocumentMetadata(pydantic.BaseModel):

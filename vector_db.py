@@ -8,11 +8,46 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
     FilterSelector,
 )
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter, before_sleep_log
+import re
 
 logger = logging.getLogger(__name__)
+
+
+def compute_lexical_score(query: Optional[str], text: str) -> float:
+    """Computes normalized keyword/token overlap score between query and document text."""
+    if not query or not text:
+        return 0.0
+    query_tokens = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
+    if not query_tokens:
+        return 0.0
+    text_lower = text.lower()
+    matches = sum(1 for t in set(query_tokens) if t in text_lower)
+    return matches / len(set(query_tokens))
+
+
+def deduplicate_candidate_chunks(candidates: List[Dict[str, Any]], threshold: float = 0.85) -> List[Dict[str, Any]]:
+    """Deduplicates near-identical candidate passages retrieved from vector DB."""
+    filtered: List[Dict[str, Any]] = []
+    seen_sets: List[set] = []
+    for c in candidates:
+        words = set(re.findall(r"\w+", c.get("text", "").lower()))
+        if not words:
+            continue
+        is_dup = False
+        for seen in seen_sets:
+            inter = len(words & seen)
+            un = len(words | seen)
+            if un > 0 and (inter / un) >= threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            filtered.append(c)
+            seen_sets.append(words)
+    return filtered
 
 
 class QdrantStorage:
@@ -69,43 +104,111 @@ class QdrantStorage:
 
         return total
 
-    def search(self, query_vector: List[float], top_k: int = 5, workspace_id: Optional[str] = None) -> Dict[str, Any]:
+    def search(
+        self,
+        query_vector: List[float],
+        top_k: int = 5,
+        workspace_id: Optional[str] = None,
+        document_ids: Optional[List[str]] = None,
+        query_text: Optional[str] = None,
+        similarity_threshold: float = 0.0,
+        enable_hybrid: bool = True,
+    ) -> Dict[str, Any]:
         """
-        Performs vector search in Qdrant.
-        When workspace_id is provided, applies a strict tenant-isolation filter
-        so vectors from other workspaces can never be retrieved.
+        Performs vector search in Qdrant with tenant isolation, document filtering,
+        hybrid BM25/keyword re-ranking, and near-identical passage deduplication.
         """
-        query_filter = None
+        must_conditions = []
         if workspace_id:
-            query_filter = Filter(
-                must=[
-                    FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
-                ]
+            must_conditions.append(
+                FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
             )
+        if document_ids:
+            if len(document_ids) == 1:
+                must_conditions.append(
+                    FieldCondition(key="document_id", match=MatchValue(value=document_ids[0]))
+                )
+            else:
+                must_conditions.append(
+                    FieldCondition(key="document_id", match=MatchAny(any=document_ids))
+                )
 
+        query_filter = Filter(must=must_conditions) if must_conditions else None
+
+        candidate_limit = max(top_k * 3, 15)
         try:
             results = self.client.query_points(
                 collection_name=self.collection,
                 query=query_vector,
                 query_filter=query_filter,
                 with_payload=True,
-                limit=top_k,
+                limit=candidate_limit,
             )
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
-            return {"contexts": [], "sources": []}
+            return {"contexts": [], "sources": [], "citations": []}
 
-        contexts = []
-        sources = set()
-
-        for r in results.points:
+        candidates = []
+        points = getattr(results, "points", []) or []
+        for r in points:
             payload = getattr(r, "payload", None) or {}
             text = payload.get("text", "")
-            source = payload.get("source", "")
-            if text:
-                contexts.append(text)
-                sources.add(source)
-        return {"contexts": contexts, "sources": list(sources)}
+            if not text:
+                continue
+
+            raw_score = getattr(r, "score", 0.80)
+            if raw_score is None:
+                raw_score = 0.80
+
+            lex_score = compute_lexical_score(query_text, text) if (query_text and enable_hybrid) else 0.0
+            # Hybrid fusion: 70% dense vector score + 30% lexical keyword overlap
+            hybrid_score = (0.70 * float(raw_score) + 0.30 * float(lex_score)) if enable_hybrid else float(raw_score)
+
+            if hybrid_score < similarity_threshold:
+                continue
+
+            candidates.append({
+                "text": text,
+                "source": payload.get("source", "document.pdf"),
+                "document_id": payload.get("document_id", ""),
+                "page_number": int(payload.get("page_number", 1) or 1),
+                "chunk_index": int(payload.get("chunk_index", 0) or 0),
+                "heading": payload.get("heading"),
+                "score": round(float(hybrid_score), 4),
+                "dense_score": round(float(raw_score), 4),
+                "lexical_score": round(float(lex_score), 4),
+            })
+
+        # Sort by hybrid score descending
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # Deduplicate near-identical candidate passages
+        deduped = deduplicate_candidate_chunks(candidates, threshold=0.85)
+
+        # Take top_k
+        top_candidates = deduped[:top_k]
+
+        contexts = [c["text"] for c in top_candidates]
+        sources = list(dict.fromkeys(c["source"] for c in top_candidates))
+        citations = [
+            {
+                "document_name": c["source"],
+                "document_id": c["document_id"],
+                "page_number": c["page_number"],
+                "chunk_index": c["chunk_index"],
+                "relevant_text": c["text"],
+                "score": c["score"],
+                "heading": c["heading"],
+                "verified": True,
+            }
+            for c in top_candidates
+        ]
+
+        return {
+            "contexts": contexts,
+            "sources": sources,
+            "citations": citations,
+        }
 
     def delete_by_source(self, source_id: str) -> bool:
         """

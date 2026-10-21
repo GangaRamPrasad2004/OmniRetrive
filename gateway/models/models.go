@@ -83,6 +83,9 @@ type AddMemberRequest struct {
 }
 
 type QueryRequest struct {
-	Question string `json:"question"`
-	TopK     int    `json:"top_k"`
+	Question            string   `json:"question"`
+	TopK                int      `json:"top_k"`
+	DocumentIDs         []string `json:"document_ids,omitempty"`
+	SimilarityThreshold float64  `json:"similarity_threshold,omitempty"`
+	EnableHybrid        *bool    `json:"enable_hybrid,omitempty"`
 }

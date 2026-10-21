@@ -295,16 +295,29 @@ func (h *ProxyHandler) QueryDocuments(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Question cannot be empty", http.StatusBadRequest)
 		return
 	}
+	if len(req.Question) > 2000 {
+		jsonError(w, "Question exceeds maximum allowed length of 2,000 characters", http.StatusBadRequest)
+		return
+	}
 
 	if req.TopK <= 0 {
 		req.TopK = 5
+	} else if req.TopK > 20 {
+		req.TopK = 20
 	}
 
 	// Forward query to Python AI service, with mandatory verified workspace_id
 	payload := map[string]interface{}{
-		"question":     req.Question,
-		"top_k":        req.TopK,
-		"workspace_id": workspaceID,
+		"question":             req.Question,
+		"top_k":                req.TopK,
+		"workspace_id":         workspaceID,
+		"similarity_threshold": req.SimilarityThreshold,
+	}
+	if len(req.DocumentIDs) > 0 {
+		payload["document_ids"] = req.DocumentIDs
+	}
+	if req.EnableHybrid != nil {
+		payload["enable_hybrid"] = *req.EnableHybrid
 	}
 
 	bodyBytes, _ := json.Marshal(payload)

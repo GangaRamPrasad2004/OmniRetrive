@@ -260,17 +260,21 @@ def cancel_doc_tenant(workspace_id: str, doc_id: str) -> dict:
     return resp.json()
 
 
-def query_rag_tenant(workspace_id: str, question: str, top_k: int) -> dict:
+def query_rag_tenant(workspace_id: str, question: str, top_k: int, document_ids: list = None) -> dict:
     headers = get_auth_headers()
     if is_gateway_alive() and st.session_state.auth_token:
         url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/query"
     else:
         url = f"{BACKEND_URL}/query"
 
+    payload = {"question": question, "top_k": top_k, "workspace_id": workspace_id}
+    if document_ids:
+        payload["document_ids"] = document_ids
+
     resp = requests.post(
         url,
         headers=headers,
-        json={"question": question, "top_k": top_k, "workspace_id": workspace_id},
+        json=payload,
         timeout=45,
     )
     if resp.status_code != 200:
@@ -634,32 +638,76 @@ with tab_qa:
     else:
         st.info(f"💡 You have {ready_count} indexed document(s) ready in this workspace.")
 
-    with st.form("rag_tenant_query_form"):
-        question = st.text_input("Your question", placeholder="e.g. What are the key contract terms in this workspace?")
-        top_k = st.number_input(
-            "Context Chunks to Retrieve",
-            min_value=1,
-            max_value=20,
-            value=5,
-            step=1,
+    # Ready document selection
+    ready_docs_map = {d["id"]: d["filename"] for d in docs if d.get("is_ready_for_qa")}
+    selected_doc_ids = []
+    if ready_count > 1:
+        target_mode = st.radio(
+            "Query Target",
+            ["All Ready Documents in Workspace", "Specific Document(s)"],
+            horizontal=True,
         )
+        if target_mode == "Specific Document(s)":
+            chosen = st.multiselect(
+                "Filter search to specific documents:",
+                options=list(ready_docs_map.keys()),
+                format_func=lambda x: ready_docs_map.get(x, x),
+            )
+            selected_doc_ids = chosen
+
+    with st.form("rag_tenant_query_form"):
+        question = st.text_input("Your question", placeholder="e.g. What are the key terms in Section 3?")
+        q_col1, q_col2 = st.columns([1, 3])
+        with q_col1:
+            top_k = st.number_input(
+                "Top-K Chunks",
+                min_value=1,
+                max_value=20,
+                value=5,
+                step=1,
+            )
+        with q_col2:
+            st.caption("Hybrid search fuses dense semantic embeddings with lexical keyword matching for high recall.")
         submitted = st.form_submit_button("Ask Question", type="primary")
 
         if submitted and question.strip():
             with st.spinner(f"Querying Qdrant vectors strictly for workspace '{active_ws_id}'..."):
                 try:
-                    res = query_rag_tenant(active_ws_id, question.strip(), int(top_k))
+                    res = query_rag_tenant(
+                        active_ws_id,
+                        question.strip(),
+                        int(top_k),
+                        document_ids=selected_doc_ids if selected_doc_ids else None,
+                    )
                     answer = res.get("answer", "")
                     sources = res.get("sources", [])
+                    citations = res.get("citations", [])
                     num_ctx = res.get("num_contexts", 0)
+                    is_insufficient = res.get("insufficient_context", False)
+
+                    if is_insufficient:
+                        st.warning("⚠️ **Context Insufficient**: The retrieved documents in this workspace do not contain sufficient evidence to answer this question.")
 
                     st.markdown("### 💬 Answer")
                     st.write(answer or "(No answer generated)")
 
-                    if sources:
+                    if citations:
+                        st.markdown(f"#### 📚 Verified Source Citations ({len(citations)})")
+                        for idx, cit in enumerate(citations, start=1):
+                            doc_name = cit.get("document_name", "Unknown")
+                            page = cit.get("page_number", 1)
+                            score = cit.get("score", 0.0)
+                            heading = cit.get("heading")
+                            snippet = cit.get("relevant_text", "")
+                            heading_str = f" • *{heading}*" if heading else ""
+
+                            with st.expander(f"Citation {idx}: 📄 {doc_name} — Page {page}{heading_str} (Score: {score:.2f})"):
+                                st.markdown(f"**Document**: `{doc_name}` &nbsp;|&nbsp; **Page**: `{page}` &nbsp;|&nbsp; **Relevance Score**: `{score:.2f}`")
+                                st.markdown(f"> {snippet}")
+                        st.caption(f"Retrieved from {num_ctx} context chunks inside workspace '{active_ws_id}'. All citations verified against retrieved Qdrant vectors.")
+                    elif sources:
                         st.markdown("#### 📚 Verified Workspace Sources")
                         for s in sources:
                             st.write(f"- `{s}`")
-                        st.caption(f"Retrieved from {num_ctx} context chunks inside workspace '{active_ws_id}'.")
                 except Exception as e:
                     st.error(f"❌ Query error: {str(e)}")
