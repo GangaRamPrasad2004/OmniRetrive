@@ -16,10 +16,11 @@ import inngest
 from inngest.experimental import ai
 import inngest.fast_api
 
-from database import init_db, get_db, SessionLocal, Document, DocumentJob
+from database import init_db, get_db, SessionLocal, Document, DocumentJob, EvalRun, EvalItemResult
 from file_utils import validate_pdf_file, compute_sha256, sanitize_filename
 from data_loader import load_and_chunk_pdf, load_and_chunk_pdf_with_metadata, embed_texts
 from vector_db import QdrantStorage
+from eval.runner import EvalRunner, compare_runs
 from custom_types import (
     RAGChunksAndSrc,
     RAGQueryResult,
@@ -972,4 +973,123 @@ def cancel_document_job(document_id: str, db: Session = Depends(get_db)):
         "status": "cancelled",
         "message": f"Ingestion job for '{doc.filename}' cancelled successfully.",
         "document": doc.to_dict(),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATION FRAMEWORK API ENDPOINTS (Isolated from production request path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EvalRunRequest(BaseModel):
+    run_name: str = "manual_eval_run"
+    top_k: int = 5
+    enable_hybrid: bool = True
+    similarity_threshold: float = 0.0
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    workspace_id: Optional[str] = None
+    save_to_db: bool = True
+
+
+@app.post("/eval/runs")
+def trigger_evaluation_run(req: EvalRunRequest, db: Session = Depends(get_db)):
+    """
+    Triggers an automated evaluation run across the version-controlled evaluation dataset.
+    Measures Recall@k, MRR, nDCG, Citation Correctness, Refusal Accuracy, Latency, and Cost.
+    Strictly isolated from the main production request path.
+    """
+    runner = EvalRunner(workspace_id=req.workspace_id, db=db)
+    summary = runner.run_evaluation(
+        run_name=req.run_name,
+        top_k=req.top_k,
+        enable_hybrid=req.enable_hybrid,
+        similarity_threshold=req.similarity_threshold,
+        chunk_size=req.chunk_size,
+        chunk_overlap=req.chunk_overlap,
+        save_to_db=req.save_to_db,
+    )
+    return summary
+
+
+@app.get("/eval/runs")
+def list_evaluation_runs(limit: int = Query(20, ge=1, le=100), db: Session = Depends(get_db)):
+    """
+    Lists historical evaluation runs with aggregate metrics over time.
+    """
+    runs = db.query(EvalRun).order_by(desc(EvalRun.created_at)).limit(limit).all()
+    return {
+        "runs": [r.to_dict() for r in runs],
+        "total": len(runs),
+    }
+
+
+@app.get("/eval/runs/{run_id}")
+def get_evaluation_run_details(run_id: str, db: Session = Depends(get_db)):
+    """
+    Retrieves detailed results for a specific evaluation run, including per-query breakdown.
+    """
+    run = db.query(EvalRun).filter(EvalRun.id == run_id).first()
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Evaluation run '{run_id}' not found.",
+        )
+    run_data = run.to_dict()
+    items = db.query(EvalItemResult).filter(EvalItemResult.run_id == run_id).all()
+    run_data["items"] = [item.to_dict() for item in items]
+    return run_data
+
+
+@app.get("/eval/compare")
+def compare_evaluation_runs(
+    run_a: str = Query(..., description="ID of baseline evaluation run"),
+    run_b: str = Query(..., description="ID of experimental evaluation run"),
+    db: Session = Depends(get_db),
+):
+    """
+    Compares two evaluation runs and returns metric deltas (e.g. comparing chunk sizes, top-k, or hybrid vs dense).
+    """
+    r_a = db.query(EvalRun).filter(EvalRun.id == run_a).first()
+    r_b = db.query(EvalRun).filter(EvalRun.id == run_b).first()
+    if not r_a:
+        raise HTTPException(status_code=404, detail=f"Baseline run '{run_a}' not found.")
+    if not r_b:
+        raise HTTPException(status_code=404, detail=f"Comparison run '{run_b}' not found.")
+
+    comparison = compare_runs(r_a.to_dict(), r_b.to_dict())
+    return comparison
+
+
+@app.get("/eval/report")
+def generate_evaluation_report(db: Session = Depends(get_db)):
+    """
+    Generates a markdown summary report of historical evaluation runs over time.
+    """
+    runs = db.query(EvalRun).order_by(desc(EvalRun.created_at)).limit(10).all()
+    if not runs:
+        return {"report_markdown": "# OmniRetrive RAG Evaluation Report\n\nNo evaluation runs recorded yet. Trigger an evaluation run via `POST /eval/runs`."}
+
+    lines = [
+        "# OmniRetrive: RAG Evaluation Report Over Time",
+        "",
+        "| Run Name | Date (UTC) | MRR | nDCG | Recall@1 | Recall@3 | Citation Rec. | Refusal Acc. | Avg Latency | Est. Cost |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    ]
+    for r in runs:
+        d = r.to_dict()
+        det = d["metrics"]["deterministic"]
+        perf = d["performance"]
+        created = d["created_at"][:19].replace("T", " ") if d["created_at"] else ""
+        lines.append(
+            f"| **{r.run_name}** | {created} | {det['mrr']:.4f} | {det['ndcg']:.4f} | "
+            f"{det['recall_at_1'] * 100:.1f}% | {det['recall_at_3'] * 100:.1f}% | "
+            f"{det['citation_recall'] * 100:.1f}% | {det['refusal_accuracy'] * 100:.1f}% | "
+            f"{perf['avg_latency_ms']:.1f} ms | ${perf['estimated_cost_usd']:.5f} |"
+        )
+
+    lines.append("")
+    lines.append("> **Note**: Deterministic metrics are computed directly against ground-truth target passages. Model-based metrics are labeled heuristic.")
+    return {
+        "report_markdown": "\n".join(lines),
+        "total_runs": len(runs),
     }

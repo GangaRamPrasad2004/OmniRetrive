@@ -1,0 +1,90 @@
+[
+  {
+    "id": "eval_q01",
+    "query": "What encryption algorithms are required for data at rest and data in transit?",
+    "category": "security",
+    "expected_document": "security_policy.pdf",
+    "expected_page": 1,
+    "expected_passage": "All data at rest must use AES-256-GCM. TLS 1.3 is mandatory for data in transit.",
+    "reference_answer": "Data at rest must be encrypted using AES-256-GCM, while data in transit must use TLS 1.3.",
+    "key_entities": ["AES-256-GCM", "TLS 1.3"],
+    "is_answerable": true
+  },
+  {
+    "id": "eval_q02",
+    "query": "What are the core technical standards defined in Section 4.1.2?",
+    "category": "security",
+    "expected_document": "security_policy.pdf",
+    "expected_page": 1,
+    "expected_passage": "Section 4.1.2: Encryption Standards. All data at rest must use AES-256-GCM.",
+    "reference_answer": "Section 4.1.2 defines Encryption Standards, mandating AES-256-GCM for data at rest and TLS 1.3 for transit.",
+    "key_entities": ["Section 4.1.2", "Encryption Standards"],
+    "is_answerable": true
+  },
+  {
+    "id": "eval_q03",
+    "query": "What are the allowed workspace roles under the access control policy?",
+    "category": "access_control",
+    "expected_document": "security_policy.pdf",
+    "expected_page": 2,
+    "expected_passage": "Section 4.2.0: Access Control and RBAC. Workspace roles are strictly owner, admin, and member.",
+    "reference_answer": "Workspace roles are strictly owner, admin, and member under the RBAC policy.",
+    "key_entities": ["owner", "admin", "member"],
+    "is_answerable": true
+  },
+  {
+    "id": "eval_q04",
+    "query": "Which compliance certifications and audit standards were achieved in the 2026 report?",
+    "category": "compliance",
+    "expected_document": "compliance_audit.pdf",
+    "expected_page": 5,
+    "expected_passage": "The organization achieved full ISO 27001:2022 and SOC-2 Type II audit compliance with zero non-conformities.",
+    "reference_answer": "The organization achieved full ISO 27001:2022 and SOC-2 Type II audit compliance with zero non-conformities.",
+    "key_entities": ["ISO 27001:2022", "SOC-2 Type II"],
+    "is_answerable": true
+  },
+  {
+    "id": "eval_q05",
+    "query": "By how much did the operating margin expand in Q3 2026 and what was the final percentage?",
+    "category": "financial",
+    "expected_document": "financials_q3.pdf",
+    "expected_page": 2,
+    "expected_passage": "In Q3 2026, operating margin expanded by 340 bps to 26.4%, driven by AI automation efficiencies.",
+    "reference_answer": "The operating margin expanded by 340 bps to 26.4% in Q3 2026.",
+    "key_entities": ["340 bps", "26.4%"],
+    "is_answerable": true
+  },
+  {
+    "id": "eval_q06",
+    "query": "What is the company paid annual vacation and parental leave policy?",
+    "category": "negative_control",
+    "expected_document": null,
+    "expected_page": null,
+    "expected_passage": null,
+    "reference_answer": "Based on the provided documents in this workspace, there is insufficient relevant information to answer this question.",
+    "key_entities": [],
+    "is_answerable": false
+  },
+  {
+    "id": "eval_q07",
+    "query": "What is the projected revenue target for fiscal year 2035 in the European division?",
+    "category": "negative_control",
+    "expected_document": null,
+    "expected_page": null,
+    "expected_passage": null,
+    "reference_answer": "Based on the provided documents in this workspace, there is insufficient relevant information to answer this question.",
+    "key_entities": [],
+    "is_answerable": false
+  },
+  {
+    "id": "eval_q08",
+    "query": "How are cryptographic keys managed and rotated according to the security documentation?",
+    "category": "security",
+    "expected_document": "security_policy.pdf",
+    "expected_page": 1,
+    "expected_passage": "All data at rest must use AES-256-GCM. TLS 1.3 is mandatory for data in transit.",
+    "reference_answer": "Data protection mandates AES-256-GCM at rest and TLS 1.3 in transit.",
+    "key_entities": ["AES-256-GCM"],
+    "is_answerable": true
+  }
+]
