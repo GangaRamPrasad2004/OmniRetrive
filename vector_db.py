@@ -10,6 +10,7 @@ from qdrant_client.models import (
     MatchValue,
     FilterSelector,
 )
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, before_sleep_log
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +30,44 @@ class QdrantStorage:
         except Exception as e:
             logger.warning(f"Could not connect or initialize Qdrant collection '{collection}': {e}")
 
-    def upsert(self, ids: List[str], vectors: List[List[float]], payloads: List[Dict[str, Any]]):
-        points = [
-            PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
-            for i in range(len(ids))
-        ]
-        return self.client.upsert(self.collection, points=points)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(initial=0.5, max=5.0, jitter=0.5),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )
+    def _upsert_batch_with_retry(self, batch_points: List[PointStruct]):
+        """Upsert a single batch of points with exponential backoff on transient network failures."""
+        self.client.upsert(self.collection, points=batch_points)
+
+    def upsert(
+        self,
+        ids: List[str],
+        vectors: List[List[float]],
+        payloads: List[Dict[str, Any]],
+        batch_size: int = 64,
+    ) -> int:
+        """
+        Batched Qdrant upserting with bounded batch size and retry backoff.
+        Prevents network payload limits and timeouts when indexing large documents.
+        """
+        total = len(ids)
+        if total == 0:
+            return 0
+
+        for i in range(0, total, batch_size):
+            batch_slice = slice(i, i + batch_size)
+            batch_ids = ids[batch_slice]
+            batch_vecs = vectors[batch_slice]
+            batch_payloads = payloads[batch_slice]
+
+            points = [
+                PointStruct(id=batch_ids[j], vector=batch_vecs[j], payload=batch_payloads[j])
+                for j in range(len(batch_ids))
+            ]
+            self._upsert_batch_with_retry(points)
+
+        return total
 
     def search(self, query_vector: List[float], top_k: int = 5, workspace_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -77,7 +110,7 @@ class QdrantStorage:
     def delete_by_source(self, source_id: str) -> bool:
         """
         Delete all vector points associated with a specific document source or document ID.
-        Ensures deletion removes derived vector data from Qdrant.
+        Ensures deletion removes derived vector data from Qdrant and safely replaces obsolete vectors.
         """
         try:
             filter_condition = Filter(

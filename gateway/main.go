@@ -109,6 +109,10 @@ func SetupRouter(database *db.DB) *chi.Mux {
 				r.With(middleware.WorkspaceRBAC(database, models.RoleMember)).
 					Post("/{docId}/retry", proxyH.RetryDocument)
 
+				// Cancel Ingestion (Any member)
+				r.With(middleware.WorkspaceRBAC(database, models.RoleMember)).
+					Post("/{docId}/cancel", proxyH.CancelDocument)
+
 				// Delete Document (Only Admin or Owner)
 				r.With(middleware.WorkspaceRBAC(database, models.RoleAdmin)).
 					Delete("/{docId}", proxyH.DeleteDocument)

@@ -259,7 +259,17 @@ func TestMultiTenant_CrossWorkspaceIsolation(t *testing.T) {
 	if w.Code != http.StatusForbidden {
 		t.Errorf("security breach: Tenant B deleted document in Tenant A, got %d (expected 403)", w.Code)
 	}
+
+	// Test Case 5: Tenant B tries to cancel an ingestion job in Tenant A's workspace
+	req = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/workspaces/%s/documents/doc-secret-123/cancel", wsAcme.ID), nil)
+	req.Header.Set("Authorization", "Bearer "+tokenTenantB)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("security breach: Tenant B cancelled document job in Tenant A, got %d (expected 403)", w.Code)
+	}
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. RATE LIMITING TESTS

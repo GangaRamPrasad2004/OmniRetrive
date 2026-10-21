@@ -244,6 +244,42 @@ func (h *ProxyHandler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// CancelDocument cancels an in-flight or queued ingestion job
+func (h *ProxyHandler) CancelDocument(w http.ResponseWriter, r *http.Request) {
+	workspaceID := chi.URLParam(r, "workspaceId")
+	docID := chi.URLParam(r, "docId")
+
+	// Verify document belongs to this workspace
+	getURL := fmt.Sprintf("%s/documents/%s", h.AIServiceURL, url.PathEscape(docID))
+	getReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, getURL, nil)
+	getResp, err := h.client.Do(getReq)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+		return
+	}
+	defer getResp.Body.Close()
+
+	var docData map[string]interface{}
+	_ = json.NewDecoder(getResp.Body).Decode(&docData)
+	if docData["workspace_id"] != workspaceID {
+		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+		return
+	}
+
+	targetURL := fmt.Sprintf("%s/documents/%s/cancel", h.AIServiceURL, url.PathEscape(docID))
+	outReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, nil)
+	resp, err := h.client.Do(outReq)
+	if err != nil {
+		jsonError(w, "AI backend service unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
 // QueryDocuments executes a question-answering query strictly filtered by workspace_id
 func (h *ProxyHandler) QueryDocuments(w http.ResponseWriter, r *http.Request) {
 	workspaceID := chi.URLParam(r, "workspaceId")

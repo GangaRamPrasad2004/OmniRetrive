@@ -53,6 +53,7 @@ st.markdown(
     .badge-queued { background-color: #fff3cd; color: #664d03; }
     .badge-retrying { background-color: #ffe5d0; color: #8a3b00; }
     .badge-failed { background-color: #f8d7da; color: #842029; }
+    .badge-cancelled { background-color: #e2e3e5; color: #41464b; }
     .badge-ready { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
     .badge-role-owner { background-color: #cff4fc; color: #055160; font-weight: bold; }
     .badge-role-admin { background-color: #e2d9f3; color: #491217; }
@@ -245,6 +246,20 @@ def delete_doc_tenant(workspace_id: str, doc_id: str) -> dict:
     return resp.json()
 
 
+def cancel_doc_tenant(workspace_id: str, doc_id: str) -> dict:
+    headers = get_auth_headers()
+    if is_gateway_alive() and st.session_state.auth_token:
+        url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/documents/{doc_id}/cancel"
+    else:
+        url = f"{BACKEND_URL}/documents/{doc_id}/cancel"
+
+    resp = requests.post(url, headers=headers, timeout=15)
+    if resp.status_code not in (200, 201):
+        err = resp.json().get("error") or resp.json().get("detail") or resp.text
+        raise RuntimeError(err)
+    return resp.json()
+
+
 def query_rag_tenant(workspace_id: str, question: str, top_k: int) -> dict:
     headers = get_auth_headers()
     if is_gateway_alive() and st.session_state.auth_token:
@@ -282,6 +297,7 @@ def get_status_badge_html(status_val: str, is_ready: bool) -> str:
         "queued": '<span class="badge badge-queued">Queued</span>',
         "retrying": '<span class="badge badge-retrying">Retrying</span>',
         "failed": '<span class="badge badge-failed">Failed</span>',
+        "cancelled": '<span class="badge badge-cancelled">Cancelled</span>',
     }
     badge = badges.get(status_val, f'<span class="badge">{status_val}</span>')
     if is_ready:
@@ -563,9 +579,9 @@ with tab_docs:
                 if status_val == "failed" and err_msg:
                     st.error(f"⚠️ Processing Error: {err_msg}")
 
-                act_col1, act_col2, _ = st.columns([2, 2, 6])
+                act_col1, act_col2, act_col3, _ = st.columns([2, 2, 2, 4])
 
-                if status_val in ("failed", "queued"):
+                if status_val in ("failed", "cancelled"):
                     with act_col1:
                         if st.button("🔄 Retry", key=f"retry_{doc_id}"):
                             with st.spinner("Retrying job..."):
@@ -577,7 +593,19 @@ with tab_docs:
                                 except Exception as e:
                                     st.error(f"Failed to retry: {e}")
 
-                with act_col2:
+                if status_val in ("queued", "processing", "retrying"):
+                    with act_col2:
+                        if st.button("🛑 Cancel", key=f"cancel_{doc_id}", help="Cancel in-flight job and clean up vectors"):
+                            with st.spinner("Cancelling job..."):
+                                try:
+                                    cancel_res = cancel_doc_tenant(active_ws_id, doc_id)
+                                    st.info(cancel_res.get("message", "Job cancelled."))
+                                    time.sleep(0.5)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to cancel: {e}")
+
+                with act_col3:
                     if st.button("🗑️ Delete", key=f"del_{doc_id}", help="Delete document and workspace vectors"):
                         with st.spinner("Deleting document and vector records..."):
                             try:
@@ -587,6 +615,7 @@ with tab_docs:
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Failed to delete: {e}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -60,6 +60,9 @@ def _update_doc_status(
     try:
         doc = db.query(Document).filter(Document.id == doc_id).first()
         if doc:
+            # If document was cancelled, do not overwrite cancelled state
+            if doc.status == "cancelled" and status_val != "cancelled":
+                return
             doc.status = status_val
             if error_msg is not None:
                 doc.error_message = error_msg
@@ -81,6 +84,7 @@ def _update_doc_status(
 @inngest_client.create_function(
     fn_id="RAG: Ingest PDF",
     trigger=inngest.TriggerEvent(event="rag/ingest_pdf"),
+    retries=3,
     throttle=inngest.Throttle(limit=10, period=datetime.timedelta(minutes=1)),
     rate_limit=inngest.RateLimit(
         limit=5,
@@ -98,6 +102,15 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     _update_doc_status(document_id, "processing")
 
     def _load(ctx: inngest.Context) -> RAGChunksAndSrc:
+        if document_id:
+            db_chk = SessionLocal()
+            try:
+                curr_doc = db_chk.query(Document).filter(Document.id == document_id).first()
+                if curr_doc and curr_doc.status == "cancelled":
+                    logger.info(f"Document {document_id} was cancelled before loading.")
+                    return RAGChunksAndSrc(chunks=[], source_id=source_id, document_id=document_id, workspace_id=workspace_id)
+            finally:
+                db_chk.close()
         try:
             chunks = load_and_chunk_pdf(pdf_path)
             _update_doc_status(document_id, "processing", chunk_count=len(chunks))
@@ -119,13 +132,26 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             doc_id = chunks_and_src.document_id
             ws_id = chunks_and_src.workspace_id or "default_workspace"
 
+            # Check if job was cancelled while load was running
+            if doc_id:
+                db_chk = SessionLocal()
+                try:
+                    curr_doc = db_chk.query(Document).filter(Document.id == doc_id).first()
+                    if curr_doc and curr_doc.status == "cancelled":
+                        logger.info(f"Document {doc_id} was cancelled before embedding/upsert.")
+                        return RAGUpsertResult(ingested=0, document_id=doc_id, workspace_id=ws_id)
+                finally:
+                    db_chk.close()
+
             if not chunks:
                 _update_doc_status(doc_id, "completed", chunk_count=0)
                 return RAGUpsertResult(ingested=0, document_id=doc_id, workspace_id=ws_id)
 
-            vecs = embed_texts(chunks)
+            vecs = embed_texts(chunks, batch_size=16)
+            # Idempotent deterministic UUIDv5 points based on doc_id and index
+            point_base = doc_id or src
             ids = [
-                str(uuid.uuid5(uuid.NAMESPACE_URL, f"{src}:{i}"))
+                str(uuid.uuid5(uuid.NAMESPACE_URL, f"{point_base}:{i}"))
                 for i in range(len(chunks))
             ]
             payloads = [
@@ -146,7 +172,12 @@ async def rag_ingest_pdf(ctx: inngest.Context):
                 api_key=qdrant_key,
                 collection="docs_hf",
             )
-            storage.upsert(ids, vecs, payloads)
+            # Safe replacement: delete prior vectors for this document_id before upserting
+            if doc_id:
+                storage.delete_by_source(doc_id)
+
+            # Batched upsert to handle large documents without timeouts
+            storage.upsert(ids, vecs, payloads, batch_size=64)
 
             _update_doc_status(doc_id, "completed", chunk_count=len(chunks))
             return RAGUpsertResult(ingested=len(chunks), document_id=doc_id)
@@ -155,6 +186,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             error_details = f"Vector indexing failed: {str(e)}"
             _update_doc_status(document_id, "failed", error_msg=error_details)
             raise RuntimeError(error_details) from e
+
 
     try:
         chunks_and_src = await ctx.step.run(
@@ -247,11 +279,42 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
 from contextlib import asynccontextmanager
 
 
+def recover_interrupted_jobs():
+    """Recovers any ingestion jobs left in-flight after an unexpected application crash or restart."""
+    db: Session = SessionLocal()
+    try:
+        interrupted_docs = db.query(Document).filter(Document.status.in_(["processing", "retrying"])).all()
+        if interrupted_docs:
+            logger.warning(f"Found {len(interrupted_docs)} interrupted document ingestion jobs. Recovering...")
+            qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+            qdrant_key = os.getenv("QDRANT_API_KEY")
+            storage = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
+            for doc in interrupted_docs:
+                doc.status = "failed"
+                doc.error_message = "Ingestion was interrupted by application restart. Safe to retry."
+                doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                storage.delete_by_source(doc.id)
+
+            interrupted_jobs = db.query(DocumentJob).filter(DocumentJob.status.in_(["processing", "queued"])).all()
+            for j in interrupted_jobs:
+                j.status = "failed"
+                j.error_message = "Job interrupted by server restart."
+                j.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            db.commit()
+    except Exception as e:
+        logger.error(f"Error during job recovery: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Ensure database schema is created on startup."""
+    """Ensure database schema is created and recover interrupted jobs on startup."""
     init_db()
+    recover_interrupted_jobs()
     yield
+
 
 
 # Initialize FastAPI app
@@ -731,4 +794,63 @@ def cleanup_workspace_data(workspace_id: str, db: Session = Depends(get_db)):
         "status": "deleted",
         "workspace_id": workspace_id,
         "documents_deleted": deleted_count,
+    }
+
+
+@app.post("/documents/{document_id}/cancel")
+def cancel_document_job(document_id: str, db: Session = Depends(get_db)):
+    """
+    Cancels an in-flight, queued, or retrying document ingestion job,
+    safely purging any partial vector records from Qdrant.
+    """
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document with ID '{document_id}' not found.",
+        )
+
+    if doc.status == "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel document '{doc.filename}' because ingestion is already completed.",
+        )
+
+    # Transition document state to cancelled
+    doc.status = "cancelled"
+    doc.error_message = "Ingestion job was cancelled by user request."
+    doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+    # Clean up any partial vectors indexed in Qdrant
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_key = os.getenv("QDRANT_API_KEY")
+    try:
+        storage = QdrantStorage(
+            url=qdrant_url,
+            api_key=qdrant_key,
+            collection="docs_hf",
+        )
+        storage.delete_by_source(document_id)
+    except Exception as e:
+        logger.warning(f"Could not purge partial vectors on cancellation: {e}")
+
+    # Mark all active jobs as cancelled
+    active_jobs = (
+        db.query(DocumentJob)
+        .filter(
+            DocumentJob.document_id == document_id,
+            DocumentJob.status.in_(["queued", "processing", "retrying"]),
+        )
+        .all()
+    )
+    for j in active_jobs:
+        j.status = "cancelled"
+        j.error_message = "Cancelled by user."
+        j.updated_at = datetime.datetime.now(datetime.timezone.utc)
+
+    db.commit()
+    return {
+        "status": "cancelled",
+        "message": f"Ingestion job for '{doc.filename}' cancelled successfully.",
+        "document": doc.to_dict(),
     }
