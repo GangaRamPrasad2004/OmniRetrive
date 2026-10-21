@@ -205,23 +205,35 @@ def embed_texts(texts: List[str], batch_size: int = 16) -> List[List[float]]:
     Batched embedding generator with bounded concurrency and rate-limit backoff.
     Divides inputs into batches of `batch_size` (default 16) to prevent network
     payload overages and minimize HTTP round-trips.
+    Records latency, chunk counts, and provider errors through the observability service.
     """
     if not texts:
         return []
 
+    import time
+    from telemetry_client import telemetry
+
     all_embeddings: List[List[float]] = []
     total = len(texts)
+    start_time = time.perf_counter()
 
-    for i in range(0, total, batch_size):
-        batch = texts[i : i + batch_size]
-        try:
-            batch_vectors = _embed_batch_with_retry(batch)
-            all_embeddings.extend(batch_vectors)
-        except Exception as e:
-            logger.error(f"Failed to generate embeddings for batch {i}-{i+len(batch)}: {e}")
-            raise RuntimeError(
-                f"Embedding provider failed after retries: {str(e)}. "
-                "The service experienced persistent rate limits or network issues."
-            ) from e
+    try:
+        for i in range(0, total, batch_size):
+            batch = texts[i : i + batch_size]
+            try:
+                batch_vectors = _embed_batch_with_retry(batch)
+                all_embeddings.extend(batch_vectors)
+            except Exception as e:
+                logger.error(f"Failed to generate embeddings for batch {i}-{i+len(batch)}: {e}")
+                raise RuntimeError(
+                    f"Embedding provider failed after retries: {str(e)}. "
+                    "The service experienced persistent rate limits or network issues."
+                ) from e
+        dur_ms = (time.perf_counter() - start_time) * 1000
+        telemetry.record_embedding(num_chunks=total, duration_ms=dur_ms, success=True)
+    except Exception:
+        dur_ms = (time.perf_counter() - start_time) * 1000
+        telemetry.record_embedding(num_chunks=total, duration_ms=dur_ms, success=False)
+        raise
 
     return all_embeddings

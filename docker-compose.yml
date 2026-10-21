@@ -61,7 +61,23 @@ services:
       - GATEWAY_URL=http://gateway:8080
       - BACKEND_URL=http://ai-backend:8000
       - INNGEST_API_BASE=${INNGEST_API_BASE:-http://127.0.0.1:8288/v1}
+  observability:
+    build:
+      context: .
+      dockerfile: Dockerfile.observability
+    container_name: omniretrive-observability
+    ports:
+      - "8082:8082"
+    environment:
+      - PORT=8082
+      - DATABASE_PATH=/app/omniretrive.db
+      - QDRANT_URL=http://qdrant:6333
+      - BACKEND_URL=http://ai-backend:8000
+      - GATEWAY_URL=http://gateway:8080
+      - UPLOADS_DIR=/app/uploads
     depends_on:
+      - qdrant
+      - ai-backend
       - gateway
     restart: unless-stopped
 

@@ -2,11 +2,12 @@ import os
 import uuid
 import logging
 import datetime
+import time
 from pathlib import Path
 from typing import Optional, List
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Depends, status
+from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -28,9 +29,10 @@ from custom_types import (
     RAGSearchResult,
     CitationItem,
 )
+from telemetry_client import telemetry, set_context, clear_context
 
 load_dotenv()
-logger = logging.getLogger("uvicorn")
+logger = logging.getLogger("omniretrive")
 
 # Configure uploads directory
 _default_uploads = "uploads" if not os.path.exists("/app") else "/app/uploads"
@@ -99,6 +101,24 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     source_id = ctx.event.data.get("source_id", pdf_path)
     document_id = ctx.event.data.get("document_id")
     workspace_id = ctx.event.data.get("workspace_id", "default_workspace")
+    job_id = getattr(ctx.event, "id", None) or str(uuid.uuid4())
+
+    set_context(
+        document_id=document_id,
+        job_id=job_id,
+        workspace_id=workspace_id,
+    )
+    start_ingest = time.perf_counter()
+
+    logger.info(
+        f"Starting background ingestion for document '{document_id}'",
+        extra={
+            "document_id": document_id,
+            "job_id": job_id,
+            "workspace_id": workspace_id,
+            "pdf_path": pdf_path,
+        },
+    )
 
     # Mark document as processing
     _update_doc_status(document_id, "processing")
@@ -194,7 +214,6 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             _update_doc_status(document_id, "failed", error_msg=error_details)
             raise RuntimeError(error_details) from e
 
-
     try:
         chunks_and_src = await ctx.step.run(
             "load-and-chunk",
@@ -206,10 +225,34 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             lambda: _upsert(chunks_and_src),
             output_type=RAGUpsertResult,
         )
+        dur_ms = (time.perf_counter() - start_ingest) * 1000
+        telemetry.record_ingestion(success=True, duration_ms=dur_ms)
+        logger.info(
+            f"Ingestion succeeded for document '{document_id}'",
+            extra={
+                "document_id": document_id,
+                "job_id": job_id,
+                "duration_ms": round(dur_ms, 2),
+                "chunks_ingested": ingested.get("ingested", 0),
+            },
+        )
         return ingested.model_dump()
     except Exception as e:
+        dur_ms = (time.perf_counter() - start_ingest) * 1000
+        telemetry.record_ingestion(success=False, duration_ms=dur_ms, error_reason=str(e))
+        logger.error(
+            f"Ingestion failed for document '{document_id}': {e}",
+            exc_info=True,
+            extra={
+                "document_id": document_id,
+                "job_id": job_id,
+                "duration_ms": round(dur_ms, 2),
+            },
+        )
         _update_doc_status(document_id, "failed", error_msg=str(e))
         raise
+    finally:
+        clear_context()
 
 
 @inngest_client.create_function(
@@ -341,6 +384,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    """
+    Structured HTTP request tracing middleware:
+    - Extracts or generates X-Request-ID and X-Correlation-ID.
+    - Propagates request, correlation, and workspace context variables.
+    - Measures request duration and tracks status code metrics.
+    - Redacts sensitive secrets and passwords before emitting structured JSON logs.
+    """
+    request_id = (
+        request.headers.get("X-Request-ID")
+        or request.headers.get("X-Correlation-ID")
+        or str(uuid.uuid4())
+    )
+    correlation_id = request.headers.get("X-Correlation-ID") or request_id
+    workspace_id = (
+        request.headers.get("X-Workspace-ID")
+        or request.query_params.get("workspace_id")
+    )
+
+    set_context(
+        request_id=request_id,
+        correlation_id=correlation_id,
+        workspace_id=workspace_id,
+    )
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+
+        # Inject correlation and timing headers into response
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Correlation-ID"] = correlation_id
+        response.headers["X-Response-Time-Ms"] = str(duration_ms)
+
+        # Record operational metrics
+        telemetry.record_http_request(
+            method=request.method,
+            endpoint=request.url.path,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+
+        logger.info(
+            f"HTTP {request.method} {request.url.path} {response.status_code} ({duration_ms}ms)",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        telemetry.record_http_request(
+            method=request.method,
+            endpoint=request.url.path,
+            status_code=500,
+            duration_ms=duration_ms,
+        )
+        logger.error(
+            f"HTTP exception on {request.method} {request.url.path}: {exc}",
+            exc_info=True,
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "duration_ms": duration_ms,
+            },
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "detail": "Internal server error occurred.",
+                "request_id": request_id,
+            },
+            headers={
+                "X-Request-ID": request_id,
+                "X-Correlation-ID": correlation_id,
+                "X-Response-Time-Ms": str(duration_ms),
+            },
+        )
+    finally:
+        clear_context()
+
+
 # Register Inngest endpoints
 inngest.fast_api.serve(
     app,
@@ -350,7 +481,9 @@ inngest.fast_api.serve(
 
 
 @app.get("/health")
+@app.get("/healthz")
 def health():
+    """Liveness probe: returns 200 OK if service process is responsive."""
     return {"status": "ok", "service": "OmniRetrive API"}
 
 
@@ -761,6 +894,7 @@ async def query_documents(req: QueryRequestModel, db: Session = Depends(get_db))
     store = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
 
     # 4. Strict Hybrid Multi-Tenant Vector Search
+    t_ret_start = time.perf_counter()
     found = store.search(
         query_vector=query_vec,
         top_k=clamped_top_k,
@@ -769,6 +903,17 @@ async def query_documents(req: QueryRequestModel, db: Session = Depends(get_db))
         query_text=clean_question,
         similarity_threshold=req.similarity_threshold or 0.0,
         enable_hybrid=req.enable_hybrid if req.enable_hybrid is not None else True,
+    )
+    ret_dur = round((time.perf_counter() - t_ret_start) * 1000, 2)
+    telemetry.record_retrieval(len(found["contexts"]), ret_dur)
+    logger.info(
+        f"Retrieved {len(found['contexts'])} context chunk(s) in {ret_dur}ms",
+        extra={
+            "top_k": clamped_top_k,
+            "chunks_found": len(found["contexts"]),
+            "retrieval_ms": ret_dur,
+            "workspace_id": req.workspace_id,
+        },
     )
 
     raw_citations = found.get("citations", [])
@@ -816,6 +961,7 @@ async def query_documents(req: QueryRequestModel, db: Session = Depends(get_db))
     # 7. LLM Inference with Bounded Timeout and Error Handling
     hf_token = os.getenv("HF_TOKEN")
     answer = ""
+    t_llm_start = time.perf_counter()
 
     if hf_token:
         try:
@@ -834,11 +980,36 @@ async def query_documents(req: QueryRequestModel, db: Session = Depends(get_db))
                         "temperature": 0.2,
                     },
                 )
+                llm_dur = round((time.perf_counter() - t_llm_start) * 1000, 2)
                 if res.status_code == 200:
-                    answer = res.json()["choices"][0]["message"]["content"].strip()
+                    body = res.json()
+                    answer = body["choices"][0]["message"]["content"].strip()
+                    usage = body.get("usage", {})
+                    prompt_tokens = usage.get("prompt_tokens") or (len(user_prompt + system_prompt) // 4)
+                    comp_tokens = usage.get("completion_tokens") or (len(answer) // 4)
+                    cost_usd = (prompt_tokens * 0.00000015) + (comp_tokens * 0.00000060)
+                    telemetry.record_llm(
+                        duration_ms=llm_dur,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=comp_tokens,
+                        success=True,
+                        cost_usd=cost_usd,
+                    )
+                    logger.info(
+                        f"LLM inference completed in {llm_dur}ms (tokens: {prompt_tokens}+{comp_tokens}, cost: ${cost_usd:.6f})",
+                        extra={
+                            "llm_ms": llm_dur,
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": comp_tokens,
+                            "cost_usd": cost_usd,
+                        },
+                    )
                 else:
+                    telemetry.record_llm(duration_ms=llm_dur, success=False)
                     logger.warning(f"HF Router returned status {res.status_code}: {res.text[:200]}")
         except Exception as e:
+            llm_dur = round((time.perf_counter() - t_llm_start) * 1000, 2)
+            telemetry.record_llm(duration_ms=llm_dur, success=False)
             logger.warning(f"Error querying HF chat completions (using graceful fallback): {e}")
 
     # 8. Citation Verification & Grounding Check
