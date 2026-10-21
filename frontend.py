@@ -7,15 +7,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 st.set_page_config(
-    page_title="OmniRetrive | Document Intelligence",
-    page_icon="📄",
+    page_title="OmniRetrive | Enterprise Document Intelligence",
+    page_icon="🛡️",
     layout="wide",
 )
 
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:8080").rstrip("/")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 INNGEST_EVENT_KEY = os.getenv("INNGEST_EVENT_KEY", "").strip()
 INNGEST_SIGNING_KEY = os.getenv("INNGEST_SIGNING_KEY", "").strip()
 INNGEST_API_BASE = os.getenv("INNGEST_API_BASE", "http://127.0.0.1:8288/v1").strip()
+
+
+# ── Session State Initialization ───────────────────────────────────────────────
+if "auth_token" not in st.session_state:
+    st.session_state.auth_token = None
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
+if "active_workspace" not in st.session_state:
+    st.session_state.active_workspace = None
+if "workspaces" not in st.session_state:
+    st.session_state.workspaces = []
 
 
 # ── Custom Styling ─────────────────────────────────────────────────────────────
@@ -42,6 +54,9 @@ st.markdown(
     .badge-retrying { background-color: #ffe5d0; color: #8a3b00; }
     .badge-failed { background-color: #f8d7da; color: #842029; }
     .badge-ready { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .badge-role-owner { background-color: #cff4fc; color: #055160; font-weight: bold; }
+    .badge-role-admin { background-color: #e2d9f3; color: #491217; }
+    .badge-role-member { background-color: #e2e3e5; color: #41464b; }
     .doc-item {
         border: 1px solid #e2e8f0;
         border-radius: 8px;
@@ -55,58 +70,197 @@ st.markdown(
 )
 
 
-# ── Backend Client Helpers ─────────────────────────────────────────────────────
-def upload_pdf_to_backend(file) -> dict:
+# ── API Client Helpers with Tenant Isolation ──────────────────────────────────
+def get_auth_headers() -> dict:
+    if st.session_state.auth_token:
+        return {"Authorization": f"Bearer {st.session_state.auth_token}"}
+    return {}
+
+
+def is_gateway_alive() -> bool:
+    try:
+        r = requests.get(f"{GATEWAY_URL}/health", timeout=1.5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def login_user(email, password) -> dict:
     resp = requests.post(
-        f"{BACKEND_URL}/upload",
+        f"{GATEWAY_URL}/api/auth/login",
+        json={"email": email, "password": password},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        err = resp.json().get("error", "Login failed")
+        raise RuntimeError(err)
+    return resp.json()
+
+
+def register_user(email, password, full_name) -> dict:
+    resp = requests.post(
+        f"{GATEWAY_URL}/api/auth/register",
+        json={"email": email, "password": password, "full_name": full_name},
+        timeout=10,
+    )
+    if resp.status_code != 201:
+        err = resp.json().get("error", "Registration failed")
+        raise RuntimeError(err)
+    return resp.json()
+
+
+def fetch_user_workspaces() -> list:
+    if not st.session_state.auth_token:
+        return []
+    try:
+        resp = requests.get(
+            f"{GATEWAY_URL}/api/workspaces",
+            headers=get_auth_headers(),
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return []
+
+
+def create_new_workspace(name: str) -> dict:
+    resp = requests.post(
+        f"{GATEWAY_URL}/api/workspaces",
+        headers=get_auth_headers(),
+        json={"name": name},
+        timeout=10,
+    )
+    if resp.status_code != 201:
+        raise RuntimeError(resp.json().get("error", "Failed to create workspace"))
+    return resp.json()
+
+
+def fetch_workspace_details(workspace_id: str) -> dict:
+    resp = requests.get(
+        f"{GATEWAY_URL}/api/workspaces/{workspace_id}",
+        headers=get_auth_headers(),
+        timeout=10,
+    )
+    if resp.status_code == 200:
+        return resp.json()
+    return {}
+
+
+def add_workspace_member(workspace_id: str, email: str, role: str) -> dict:
+    resp = requests.post(
+        f"{GATEWAY_URL}/api/workspaces/{workspace_id}/members",
+        headers=get_auth_headers(),
+        json={"email": email, "role": role},
+        timeout=10,
+    )
+    if resp.status_code != 201:
+        raise RuntimeError(resp.json().get("error", "Failed to add member"))
+    return resp.json()
+
+
+def delete_workspace_api(workspace_id: str) -> dict:
+    resp = requests.delete(
+        f"{GATEWAY_URL}/api/workspaces/{workspace_id}",
+        headers=get_auth_headers(),
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(resp.json().get("error", "Failed to delete workspace"))
+    return resp.json()
+
+
+def upload_pdf_tenant(file, workspace_id: str) -> dict:
+    headers = get_auth_headers()
+    if is_gateway_alive() and st.session_state.auth_token:
+        url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/documents/upload"
+        data = {}
+    else:
+        url = f"{BACKEND_URL}/upload"
+        data = {"workspace_id": workspace_id, "owner_id": st.session_state.current_user["id"] if st.session_state.current_user else "default_user"}
+
+    resp = requests.post(
+        url,
+        headers=headers,
         files={"file": (file.name, file.getbuffer(), "application/pdf")},
-        data={"workspace_id": "default_workspace", "owner_id": "default_user"},
+        data=data,
         timeout=60,
     )
     if resp.status_code not in (200, 201):
         try:
-            err = resp.json().get("detail", resp.text)
+            err = resp.json().get("error") or resp.json().get("detail") or resp.text
         except Exception:
             err = resp.text
         raise RuntimeError(err)
     return resp.json()
 
 
-def fetch_documents(search=None, status_filter=None, sort_by="created_at", sort_order="desc") -> list:
+def fetch_documents_tenant(workspace_id: str, search=None, status_filter=None, sort_by="created_at", sort_order="desc") -> list:
     params = {"sort_by": sort_by, "sort_order": sort_order}
     if search:
         params["search"] = search
     if status_filter and status_filter != "All":
         params["status"] = status_filter
+
+    headers = get_auth_headers()
+    if is_gateway_alive() and st.session_state.auth_token:
+        url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/documents"
+    else:
+        url = f"{BACKEND_URL}/documents"
+        params["workspace_id"] = workspace_id
+
     try:
-        resp = requests.get(f"{BACKEND_URL}/documents", params=params, timeout=10)
+        resp = requests.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
         return resp.json().get("documents", [])
     except Exception as e:
-        st.error(f"Failed to fetch documents from backend: {e}")
+        st.error(f"Failed to fetch documents: {e}")
         return []
 
 
-def fetch_doc_details(doc_id: str) -> dict:
-    resp = requests.get(f"{BACKEND_URL}/documents/{doc_id}", timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+def retry_doc_tenant(workspace_id: str, doc_id: str) -> dict:
+    headers = get_auth_headers()
+    if is_gateway_alive() and st.session_state.auth_token:
+        url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/documents/{doc_id}/retry"
+    else:
+        url = f"{BACKEND_URL}/documents/{doc_id}/retry"
 
-
-def retry_backend_job(doc_id: str) -> dict:
-    resp = requests.post(f"{BACKEND_URL}/documents/{doc_id}/retry", timeout=15)
+    resp = requests.post(url, headers=headers, timeout=15)
     if resp.status_code not in (200, 201):
-        try:
-            err = resp.json().get("detail", resp.text)
-        except Exception:
-            err = resp.text
+        err = resp.json().get("error") or resp.json().get("detail") or resp.text
         raise RuntimeError(err)
     return resp.json()
 
 
-def delete_backend_doc(doc_id: str) -> dict:
-    resp = requests.delete(f"{BACKEND_URL}/documents/{doc_id}", timeout=15)
+def delete_doc_tenant(workspace_id: str, doc_id: str) -> dict:
+    headers = get_auth_headers()
+    if is_gateway_alive() and st.session_state.auth_token:
+        url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/documents/{doc_id}"
+    else:
+        url = f"{BACKEND_URL}/documents/{doc_id}"
+
+    resp = requests.delete(url, headers=headers, timeout=15)
     resp.raise_for_status()
+    return resp.json()
+
+
+def query_rag_tenant(workspace_id: str, question: str, top_k: int) -> dict:
+    headers = get_auth_headers()
+    if is_gateway_alive() and st.session_state.auth_token:
+        url = f"{GATEWAY_URL}/api/workspaces/{workspace_id}/query"
+    else:
+        url = f"{BACKEND_URL}/query"
+
+    resp = requests.post(
+        url,
+        headers=headers,
+        json={"question": question, "top_k": top_k, "workspace_id": workspace_id},
+        timeout=45,
+    )
+    if resp.status_code != 200:
+        err = resp.json().get("error") or resp.json().get("detail") or resp.text
+        raise RuntimeError(err)
     return resp.json()
 
 
@@ -135,91 +289,174 @@ def get_status_badge_html(status_val: str, is_ready: bool) -> str:
     return badge
 
 
-# ── Inngest Query Helpers ──────────────────────────────────────────────────────
-def send_rag_query_event(question: str, top_k: int) -> str:
-    if INNGEST_EVENT_KEY:
-        url = f"https://inn.gs/e/{INNGEST_EVENT_KEY}"
+# ── SIDEBAR: AUTHENTICATION & WORKSPACE MULTI-TENANCY ──────────────────────────
+with st.sidebar:
+    st.title("🛡️ Tenant Isolation")
+    st.caption("Secure Multi-Tenant Workspace Control")
+
+    gateway_ok = is_gateway_alive()
+    if gateway_ok:
+        st.success("🟢 Go Gateway Active")
     else:
-        url = f"{INNGEST_API_BASE}/e/rag_app"
+        st.info("ℹ️ Running in Direct Backend Mode")
 
-    resp = requests.post(
-        url,
-        json={
-            "name": "rag/query_pdf_ai",
-            "data": {
-                "question": question,
-                "top_k": top_k,
-            },
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    ids = data.get("ids", [])
-    return ids[0] if ids else data.get("id", "")
+    if not st.session_state.auth_token:
+        auth_mode = st.radio("Access Control", ["Login", "Register"], horizontal=True)
+
+        if auth_mode == "Login":
+            st.subheader("Login")
+            l_email = st.text_input("Email", key="l_email")
+            l_pass = st.text_input("Password", type="password", key="l_pass")
+            if st.button("Log In", type="primary", use_container_width=True):
+                if l_email and l_pass:
+                    try:
+                        res = login_user(l_email, l_pass)
+                        st.session_state.auth_token = res["token"]
+                        st.session_state.current_user = res["user"]
+                        st.session_state.active_workspace = res.get("default_workspace")
+                        st.success("Authenticated successfully!")
+                        time.sleep(0.4)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Login failed: {e}")
+                else:
+                    st.warning("Please fill in email and password.")
+
+        else:
+            st.subheader("Create Account")
+            r_name = st.text_input("Full Name", key="r_name")
+            r_email = st.text_input("Email", key="r_email")
+            r_pass = st.text_input("Password (min 8 chars)", type="password", key="r_pass")
+            if st.button("Register Account", type="primary", use_container_width=True):
+                if r_email and r_pass:
+                    try:
+                        res = register_user(r_email, r_pass, r_name)
+                        st.session_state.auth_token = res["token"]
+                        st.session_state.current_user = res["user"]
+                        st.session_state.active_workspace = res.get("default_workspace")
+                        st.success("Account created and workspace initialized!")
+                        time.sleep(0.4)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Registration failed: {e}")
+                else:
+                    st.warning("Please provide email and password.")
+
+    else:
+        # User is authenticated
+        user = st.session_state.current_user
+        st.markdown(f"**User:** `{user.get('full_name')}`")
+        st.caption(f"📧 {user.get('email')}")
+
+        if st.button("Logout", use_container_width=True):
+            st.session_state.auth_token = None
+            st.session_state.current_user = None
+            st.session_state.active_workspace = None
+            st.session_state.workspaces = []
+            st.rerun()
+
+        st.divider()
+
+        # Workspace Selection
+        workspaces = fetch_user_workspaces()
+        st.session_state.workspaces = workspaces
+
+        if workspaces:
+            ws_map = {w["name"]: w for w in workspaces}
+            ws_names = list(ws_map.keys())
+            current_ws_name = st.session_state.active_workspace["name"] if st.session_state.active_workspace else ws_names[0]
+            selected_ws_name = st.selectbox("Active Workspace", ws_names, index=ws_names.index(current_ws_name) if current_ws_name in ws_names else 0)
+            st.session_state.active_workspace = ws_map[selected_ws_name]
+        else:
+            if not st.session_state.active_workspace:
+                st.session_state.active_workspace = {"id": "default_workspace", "name": "Default Workspace"}
+
+        active_ws_id = st.session_state.active_workspace["id"]
+        st.caption(f"🆔 **Workspace ID:** `{active_ws_id}`")
+
+        # Workspace Details & Management
+        if active_ws_id != "default_workspace":
+            ws_details = fetch_workspace_details(active_ws_id)
+            current_role = ws_details.get("current_role", "member")
+            st.markdown(f"**Your Role:** <span class='badge badge-role-{current_role}'>{current_role.upper()}</span>", unsafe_allow_html=True)
+
+            with st.expander("👥 Workspace Members"):
+                for m in ws_details.get("members", []):
+                    st.write(f"- **{m.get('full_name') or m.get('email')}** (`{m.get('role')}`)")
+
+            if current_role in ("owner", "admin"):
+                with st.expander("➕ Invite Member"):
+                    inv_email = st.text_input("Member Email", key="inv_email")
+                    inv_role = st.selectbox("Role", ["member", "admin"] if current_role == "owner" else ["member"], key="inv_role")
+                    if st.button("Add to Workspace"):
+                        if inv_email:
+                            try:
+                                add_workspace_member(active_ws_id, inv_email, inv_role)
+                                st.success("Member added!")
+                                time.sleep(0.4)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+            if current_role == "owner":
+                with st.expander("⚠️ Danger Zone"):
+                    if st.button("Delete Entire Workspace", type="secondary"):
+                        try:
+                            delete_workspace_api(active_ws_id)
+                            st.success("Workspace deleted.")
+                            st.session_state.active_workspace = None
+                            time.sleep(0.5)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
+        with st.expander("🏢 Create Another Workspace"):
+            new_ws_name = st.text_input("Workspace Name", key="new_ws_name")
+            if st.button("Create"):
+                if new_ws_name.strip():
+                    try:
+                        new_ws = create_new_workspace(new_ws_name.strip())
+                        st.session_state.active_workspace = new_ws
+                        st.success(f"Workspace '{new_ws['name']}' created!")
+                        time.sleep(0.4)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
 
 
-def fetch_runs(event_id: str) -> list:
-    url = f"{INNGEST_API_BASE}/events/{event_id}/runs"
-    headers = {}
-    if INNGEST_SIGNING_KEY:
-        headers["Authorization"] = f"Bearer {INNGEST_SIGNING_KEY}"
-    resp = requests.get(url, headers=headers, timeout=10)
-    resp.raise_for_status()
-    return resp.json().get("data", [])
+# ── MAIN APPLICATION VIEW ──────────────────────────────────────────────────────
+active_ws = st.session_state.active_workspace or {"id": "default_workspace", "name": "Default Workspace"}
+active_ws_id = active_ws["id"]
 
-
-def wait_for_run_output(event_id: str, timeout_s: float = 120.0, poll_interval_s: float = 1.0) -> dict:
-    start = time.time()
-    last_status = None
-    while True:
-        try:
-            runs = fetch_runs(event_id)
-            if runs:
-                run = runs[0]
-                status_run = run.get("status")
-                last_status = status_run or last_status
-                if status_run in ("Completed", "Succeeded", "Success", "Finished"):
-                    return run.get("output") or {}
-                if status_run in ("Failed", "Cancelled"):
-                    raise RuntimeError(f"Workflow execution ended with status: {status_run}")
-        except Exception as e:
-            if "ended with status" in str(e):
-                raise
-        if time.time() - start > timeout_s:
-            raise TimeoutError(f"Timed out waiting for run output (last status: {last_status})")
-        time.sleep(poll_interval_s)
-
-
-# ── UI Header & Navigation ─────────────────────────────────────────────────────
 st.title("OmniRetrive")
-st.caption("AI-Powered Document Intelligence & Verification Platform")
+st.markdown(f"### 🏢 Workspace: **{active_ws['name']}**")
+st.caption(f"🔒 Multi-Tenant Boundary: All uploads, embeddings, and vector queries are strictly isolated to `{active_ws_id}`.")
 
-tab_docs, tab_qa = st.tabs(["📚 Document Management", "💬 Question Answering"])
+tab_docs, tab_qa = st.tabs(["📚 Workspace Documents", "💬 Tenant-Isolated Q&A"])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 1: DOCUMENT MANAGEMENT
+# TAB 1: TENANT DOCUMENT MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_docs:
-    st.subheader("Document Ingestion & Lifecycle")
+    st.subheader(f"Documents in '{active_ws['name']}'")
 
     # Upload Section
-    with st.expander("⬆️ Upload New PDF Document", expanded=True):
+    with st.expander("⬆️ Upload PDF to Active Workspace", expanded=True):
         uploaded_file = st.file_uploader(
             "Choose a PDF file to ingest",
             type=["pdf"],
             accept_multiple_files=False,
-            help="Supported formats: PDF. Maximum size: 50 MB. Integrity and readability are validated automatically.",
+            help="PDF only. Max size: 50 MB. Integrity and readability are validated automatically.",
         )
 
-        col_up1, col_up2 = st.columns([1, 4])
+        col_up1, _ = st.columns([1, 4])
         with col_up1:
             upload_btn = st.button("Upload & Ingest", type="primary", disabled=uploaded_file is None)
 
         if upload_btn and uploaded_file is not None:
-            with st.spinner("Validating and uploading document..."):
+            with st.spinner("Validating and uploading document to workspace..."):
                 try:
-                    res = upload_pdf_to_backend(uploaded_file)
+                    res = upload_pdf_tenant(uploaded_file, active_ws_id)
                     st_status = res.get("status")
                     if st_status == "already_exists":
                         st.info(f"ℹ️ {res.get('message')}")
@@ -228,7 +465,7 @@ with tab_docs:
                     elif st_status == "retrying":
                         st.success(f"🔄 {res.get('message')}")
                     else:
-                        st.success(f"✅ Document '{res.get('filename')}' queued for ingestion!")
+                        st.success(f"✅ Document '{res.get('filename')}' queued for workspace ingestion!")
                     time.sleep(0.5)
                     st.rerun()
                 except Exception as e:
@@ -264,8 +501,9 @@ with tab_docs:
         if st.button("🔄 Refresh"):
             st.rerun()
 
-    # Fetch Documents
-    docs = fetch_documents(
+    # Fetch Documents strictly for this tenant
+    docs = fetch_documents_tenant(
+        workspace_id=active_ws_id,
         search=search_query.strip() or None,
         status_filter=status_choice,
         sort_by=sort_choice,
@@ -279,15 +517,15 @@ with tab_docs:
     failed_docs = sum(1 for d in docs if d.get("status") == "failed")
 
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    m_col1.metric("Total Documents", total_docs)
+    m_col1.metric("Tenant Documents", total_docs)
     m_col2.metric("Ready for Q&A", ready_docs)
-    m_col3.metric("In Progress / Queued", pending_docs)
+    m_col3.metric("In Progress", pending_docs)
     m_col4.metric("Failed", failed_docs)
 
     st.write("")
 
     if not docs:
-        st.info("No documents found matching your filter criteria. Upload a PDF above to get started!")
+        st.info(f"No documents found in workspace '{active_ws['name']}'. Upload a PDF above to begin.")
     else:
         for doc in docs:
             doc_id = doc["id"]
@@ -315,26 +553,24 @@ with tab_docs:
                             <span>📦 <strong>Size:</strong> {size_str}</span> &nbsp;|&nbsp;
                             <span>📑 <strong>Pages:</strong> {pages}</span> &nbsp;|&nbsp;
                             <span>🧩 <strong>Indexed Chunks:</strong> {chunks}</span> &nbsp;|&nbsp;
-                            <span>🏷️ <strong>ID:</strong> <code>{doc_id[:8]}...</code></span>
+                            <span>🏢 <strong>Workspace:</strong> <code>{active_ws_id}</code></span>
                         </div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
 
-                # Show failure notice if failed
                 if status_val == "failed" and err_msg:
                     st.error(f"⚠️ Processing Error: {err_msg}")
 
-                # Action buttons row
-                act_col1, act_col2, act_col3 = st.columns([2, 2, 6])
+                act_col1, act_col2, _ = st.columns([2, 2, 6])
 
                 if status_val in ("failed", "queued"):
                     with act_col1:
-                        if st.button("🔄 Retry Ingestion", key=f"retry_{doc_id}"):
+                        if st.button("🔄 Retry", key=f"retry_{doc_id}"):
                             with st.spinner("Retrying job..."):
                                 try:
-                                    retry_res = retry_backend_job(doc_id)
+                                    retry_res = retry_doc_tenant(active_ws_id, doc_id)
                                     st.success(retry_res.get("message", "Job retried."))
                                     time.sleep(0.5)
                                     st.rerun()
@@ -342,84 +578,59 @@ with tab_docs:
                                     st.error(f"Failed to retry: {e}")
 
                 with act_col2:
-                    if st.button("🗑️ Delete", key=f"del_{doc_id}", help="Delete document, vectors, and files"):
+                    if st.button("🗑️ Delete", key=f"del_{doc_id}", help="Delete document and workspace vectors"):
                         with st.spinner("Deleting document and vector records..."):
                             try:
-                                delete_backend_doc(doc_id)
+                                delete_doc_tenant(active_ws_id, doc_id)
                                 st.success("Document and derived vector data deleted.")
                                 time.sleep(0.5)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Failed to delete: {e}")
 
-                with st.expander(f"Inspect Details for '{filename}'"):
-                    try:
-                        detail = fetch_doc_details(doc_id)
-                        st.json({
-                            "document_id": detail.get("id"),
-                            "filename": detail.get("filename"),
-                            "sha256_hash": detail.get("file_hash"),
-                            "file_size_bytes": detail.get("file_size"),
-                            "storage_path": detail.get("storage_path"),
-                            "status": detail.get("status"),
-                            "chunk_count": detail.get("chunk_count"),
-                            "page_count": detail.get("page_count"),
-                            "is_ready_for_qa": detail.get("is_ready_for_qa"),
-                            "created_at": detail.get("created_at"),
-                            "updated_at": detail.get("updated_at"),
-                            "jobs_history": detail.get("jobs", []),
-                        })
-                    except Exception as e:
-                        st.warning(f"Could not load details: {e}")
-
-                st.write("")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 2: QUESTION ANSWERING (RAG)
+# TAB 2: TENANT-ISOLATED QUESTION ANSWERING (RAG)
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_qa:
-    st.subheader("Ask Questions About Your Ingested Documents")
+    st.subheader(f"Ask Questions About '{active_ws['name']}' Documents")
+    st.caption("🔒 Vector search strictly applies `workspace_id` filtering. Data from other tenants is completely inaccessible.")
 
-    # Check for ready documents
-    all_docs = fetch_documents()
-    ready_count = sum(1 for d in all_docs if d.get("is_ready_for_qa"))
-
+    # Check for ready documents in this tenant
+    ready_count = sum(1 for d in docs if d.get("is_ready_for_qa"))
     if ready_count == 0:
         st.warning(
-            "⚠️ No documents are currently ready for Q&A. Please upload and ingest a PDF in the 'Document Management' tab first."
+            f"⚠️ No documents are currently ready for Q&A in '{active_ws['name']}'. Please upload and ingest a PDF in the 'Workspace Documents' tab first."
         )
     else:
-        st.info(f"💡 You have {ready_count} indexed document(s) ready for querying.")
+        st.info(f"💡 You have {ready_count} indexed document(s) ready in this workspace.")
 
-    with st.form("rag_query_form"):
-        question = st.text_input("Your question", placeholder="e.g. What are the key findings discussed in the paper?")
+    with st.form("rag_tenant_query_form"):
+        question = st.text_input("Your question", placeholder="e.g. What are the key contract terms in this workspace?")
         top_k = st.number_input(
             "Context Chunks to Retrieve",
             min_value=1,
             max_value=20,
             value=5,
             step=1,
-            help="Higher values retrieve more surrounding text from Qdrant.",
         )
         submitted = st.form_submit_button("Ask Question", type="primary")
 
         if submitted and question.strip():
-            with st.spinner("Searching vector database and generating answer with LLM..."):
+            with st.spinner(f"Querying Qdrant vectors strictly for workspace '{active_ws_id}'..."):
                 try:
-                    event_id = send_rag_query_event(question.strip(), int(top_k))
-                    output = wait_for_run_output(event_id)
-                    answer = output.get("answer", "")
-                    sources = output.get("sources", [])
-                    num_ctx = output.get("num_contexts", 0)
+                    res = query_rag_tenant(active_ws_id, question.strip(), int(top_k))
+                    answer = res.get("answer", "")
+                    sources = res.get("sources", [])
+                    num_ctx = res.get("num_contexts", 0)
 
                     st.markdown("### 💬 Answer")
                     st.write(answer or "(No answer generated)")
 
                     if sources:
-                        st.markdown("#### 📚 Sources & Citations")
+                        st.markdown("#### 📚 Verified Workspace Sources")
                         for s in sources:
                             st.write(f"- `{s}`")
-                        st.caption(f"Retrieved from {num_ctx} context chunks in Qdrant.")
+                        st.caption(f"Retrieved from {num_ctx} context chunks inside workspace '{active_ws_id}'.")
                 except Exception as e:
-                    st.error(f"❌ Error during query processing: {str(e)}")
+                    st.error(f"❌ Query error: {str(e)}")

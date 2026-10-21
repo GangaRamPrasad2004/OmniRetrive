@@ -1,0 +1,69 @@
+version: "3.8"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: omniretrive-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  ai-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: omniretrive-ai-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - UPLOADS_DIR=/app/uploads
+      - QDRANT_URL=http://qdrant:6333
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+      - HF_TOKEN=${HF_TOKEN:-}
+      - IS_PRODUCTION=true
+    depends_on:
+      - qdrant
+    volumes:
+      - ./uploads:/app/uploads
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: omniretrive-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - AI_SERVICE_URL=http://ai-backend:8000
+      - GATEWAY_DB_PATH=/app/gateway.db
+      - JWT_SECRET=${JWT_SECRET:-omniretrive-production-secret-min32characters-key}
+    depends_on:
+      - ai-backend
+    volumes:
+      - gateway-data:/app
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: omniretrive-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - PORT=8501
+      - GATEWAY_URL=http://gateway:8080
+      - BACKEND_URL=http://ai-backend:8000
+      - INNGEST_API_BASE=${INNGEST_API_BASE:-http://127.0.0.1:8288/v1}
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

@@ -6,14 +6,14 @@ OmniRetrive is an enterprise-grade document intelligence platform that ingests P
 
 ## 🏛️ System Architecture
 
-- **Backend**: FastAPI (Python 3.13) with Uvicorn.
+- **Application Gateway & Auth Backend**: Go (Chi v5) handling user authentication, JWT token issuance, workspace management, RBAC, and rate limiting (`gateway/`).
+- **AI Service & RAG Engine**: FastAPI (Python 3.13) handling document parsing, chunking, Hugging Face embeddings, Inngest jobs, and tenant-filtered Qdrant retrieval (`main.py`).
 - **Workflow & Background Tasks**: Inngest (`rag/ingest_pdf`, `rag/query_pdf_ai`).
-- **Database & Persistence**: SQLAlchemy ORM with SQLite (default for local development) and seamless PostgreSQL support via `DATABASE_URL`.
-- **Vector Database**: Qdrant (`docs_hf` collection, 768 dimensions, Cosine distance).
-- **Text Extraction & Chunking**: LlamaIndex `PDFReader` and `SentenceSplitter(chunk_size=1000, chunk_overlap=200)`.
-- **Embedding Model**: Hugging Face `BAAI/bge-base-en-v1.5` (768-d).
-- **LLM Reasoning**: Hugging Face Router `meta-llama/Llama-3.1-8B-Instruct:novita`.
-- **Frontend**: Streamlit dashboard with full document lifecycle management and interactive Q&A.
+- **Databases & Persistence**:
+  - **Gateway DB**: SQLite / PostgreSQL storing users, workspaces, and memberships.
+  - **AI Metadata DB**: SQLAlchemy storing documents, hashes, and ingestion job history.
+- **Vector Database**: Qdrant (`docs_hf` collection, 768 dimensions, Cosine distance) with strict `workspace_id` tenant filtering.
+- **Frontend**: Streamlit dashboard with authentication, workspace switching, document lifecycle management, and tenant-isolated Q&A.
 
 ---
 
@@ -50,79 +50,81 @@ OmniRetrive is an enterprise-grade document intelligence platform that ingests P
 
 ---
 
+## 🛡️ Feature 2: Authentication and Multi-Tenant Isolation
+
+### 1. User Authentication & Token Management
+- **Registration & Login**: Secure account creation with email format validation and password length checks.
+- **Password Security**: Passwords hashed using `bcrypt` with work factor 12.
+- **Token Management**: Issues signed HMAC-SHA256 JWT bearer tokens containing subject `user_id` and `email` with 24-hour expiration.
+
+### 2. Workspace Management & Role-Based Access Control (RBAC)
+- **Automatic Workspace Provisioning**: Each registered user is automatically allocated a personal default workspace where they are assigned the `owner` role.
+- **Multi-Tenant Roles**:
+  - `owner`: Full control over the workspace, ability to delete the workspace, and ability to manage admins and members.
+  - `admin`: Can upload, delete, retry documents, and invite or remove members.
+  - `member`: Can view workspace documents, upload PDFs, and query documents.
+- **Server-Side Ownership Validation**: Client-supplied tenant IDs are never trusted. All operations derive tenancy and user IDs strictly from the authenticated JWT context and verified workspace memberships.
+
+### 3. Tenant Isolation as a Vector Database Security Boundary
+- Vector payloads in Qdrant store the verified `workspace_id`.
+- Retrieval (`POST /api/workspaces/{id}/query` and `/query`) **strictly applies a mandatory Qdrant payload filter** on `workspace_id`.
+- Foreign tenant vectors are physically excluded from vector distance calculations. Retrieval authorization is enforced by the vector database engine, never by an LLM prompt.
+
+### 4. Cascade Cleanup Without Orphaned Data
+- Workspace deletion via `DELETE /api/workspaces/{id}`:
+  1. Cascade deletes all workspace memberships from the Gateway DB.
+  2. Calls `/workspaces/{id}/cleanup` on the AI service to purge all physical PDF files from disk.
+  3. Executes `delete_by_workspace` on Qdrant, purging all derived vector points.
+  4. Deletes all document records from the AI service database.
+
+### 5. Rate Limiting
+- IP-based token-bucket rate limiting applied to sensitive endpoints (e.g. `/api/auth/register`, `/api/auth/login`, and `/api/workspaces/{id}/documents/upload`).
+
+---
+
 ## 📡 API Endpoints
 
-### Health Check
-- `GET /health` — Verifies backend service status.
-
-### Document Management
-- `POST /upload`
-  - Multipart form upload (`file: UploadFile`, `workspace_id: str`, `owner_id: str`).
-  - Validates PDF, checks duplicates, creates metadata record, and queues Inngest ingestion.
-- `GET /documents`
-  - Query parameters:
-    - `search`: Filter by filename substring (case-insensitive).
-    - `status`: Filter by status (`queued`, `processing`, `completed`, `failed`, `retrying`).
-    - `workspace_id`: Filter by workspace.
-    - `sort_by`: Sort column (`created_at`, `filename`, `file_size`, `status`).
-    - `sort_order`: `asc` or `desc`.
-- `GET /documents/{document_id}`
-  - Returns complete document metadata, chunk/page metrics, QA readiness, and job audit history.
-- `POST /documents/{document_id}/retry`
-  - Safely re-queues ingestion for a failed document.
-- `DELETE /documents/{document_id}`
-  - Deletes database record, local file, and vector embeddings in Qdrant.
-
-### Inngest Workflow Handlers
-- `POST /api/inngest` — Inngest execution endpoint serving `rag_ingest_pdf` and `rag_query_pdf_ai`.
+### Go Gateway (`http://localhost:8080`)
+- `POST /api/auth/register` — Register a new user account and provision default workspace.
+- `POST /api/auth/login` — Authenticate credentials and receive JWT token.
+- `GET /api/auth/me` — Get authenticated user details and active workspaces.
+- `POST /api/workspaces` — Create a new workspace.
+- `GET /api/workspaces` — List workspaces the authenticated user belongs to.
+- `GET /api/workspaces/{workspaceId}` — Get workspace details and member list.
+- `DELETE /api/workspaces/{workspaceId}` — Delete workspace and purge all tenant data (owner only).
+- `POST /api/workspaces/{workspaceId}/members` — Invite/add member (owner or admin only).
+- `DELETE /api/workspaces/{workspaceId}/members/{userId}` — Remove member (owner or admin only).
+- `POST /api/workspaces/{workspaceId}/documents/upload` — Upload and ingest PDF into workspace.
+- `GET /api/workspaces/{workspaceId}/documents` — List workspace documents.
+- `GET /api/workspaces/{workspaceId}/documents/{docId}` — Get workspace document details.
+- `POST /api/workspaces/{workspaceId}/documents/{docId}/retry` — Retry failed document ingestion.
+- `DELETE /api/workspaces/{workspaceId}/documents/{docId}` — Delete document and vectors (admin/owner).
+- `POST /api/workspaces/{workspaceId}/query` — Multi-tenant vector retrieval and question answering.
 
 ---
 
-## ⚙️ Environment Variables
+## 🧪 Automated Test Suites
 
-Create or configure your `.env` file:
-
-```env
-# Hugging Face & Qdrant Configuration
-HF_TOKEN=hf_your_token_here
-QDRANT_URL=http://localhost:6333
-QDRANT_API_KEY=your_qdrant_key_if_applicable
-
-# Backend Configuration
-UPLOADS_DIR=uploads
-MAX_UPLOAD_SIZE_MB=50
-DATABASE_URL=sqlite:///./omniretrive.db
-IS_PRODUCTION=false
-
-# Streamlit Frontend Configuration
-BACKEND_URL=http://localhost:8000
-INNGEST_API_BASE=http://127.0.0.1:8288/v1
-INNGEST_EVENT_KEY=
-INNGEST_SIGNING_KEY=
-```
-
----
-
-## 🧪 Running the Automated Test Suite
-
-Execute the comprehensive test suite verifying validation, deduplication, retry, deletion, and API routes:
-
+### Run Go Gateway Tests (Auth, RBAC, Multi-Tenant Isolation, Rate Limiting):
 ```powershell
-.venv\Scripts\python.exe -m pytest -v tests/test_document_management.py
+cd gateway
+go test -v ./...
+```
+
+### Run Python AI Service Tests (Document Management & Vector Tenant Isolation):
+```powershell
+.venv\Scripts\python.exe -m pytest -v tests/
 ```
 
 ---
 
-## 🐳 Running with Docker
+## 🐳 Docker Deployment
 
-### Backend:
+Run all services together with Docker Compose:
 ```bash
-docker build -f Dockerfile.backend -t omniretrive-backend .
-docker run -p 8000:8000 --env-file .env omniretrive-backend
+docker-compose up --build
 ```
-
-### Frontend:
-```bash
-docker build -f Dockerfile.frontend -t omniretrive-frontend .
-docker run -p 8501:8501 --env-file .env omniretrive-frontend
-```
+* **Frontend**: `http://localhost:8501`
+* **Go Gateway**: `http://localhost:8080`
+* **Python AI Backend**: `http://localhost:8000`
+* **Qdrant Vector DB**: `http://localhost:6333`

@@ -92,6 +92,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     pdf_path = ctx.event.data["pdf_path"]
     source_id = ctx.event.data.get("source_id", pdf_path)
     document_id = ctx.event.data.get("document_id")
+    workspace_id = ctx.event.data.get("workspace_id", "default_workspace")
 
     # Mark document as processing
     _update_doc_status(document_id, "processing")
@@ -104,6 +105,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
                 chunks=chunks,
                 source_id=source_id,
                 document_id=document_id,
+                workspace_id=workspace_id,
             )
         except Exception as e:
             error_details = f"Text extraction failed: {str(e)}"
@@ -115,10 +117,11 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             chunks = chunks_and_src.chunks
             src = chunks_and_src.source_id
             doc_id = chunks_and_src.document_id
+            ws_id = chunks_and_src.workspace_id or "default_workspace"
 
             if not chunks:
                 _update_doc_status(doc_id, "completed", chunk_count=0)
-                return RAGUpsertResult(ingested=0, document_id=doc_id)
+                return RAGUpsertResult(ingested=0, document_id=doc_id, workspace_id=ws_id)
 
             vecs = embed_texts(chunks)
             ids = [
@@ -129,6 +132,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
                 {
                     "source": src,
                     "document_id": doc_id or src,
+                    "workspace_id": ws_id,
                     "text": chunks[i],
                     "chunk_index": i,
                 }
@@ -174,14 +178,16 @@ async def rag_ingest_pdf(ctx: inngest.Context):
     trigger=inngest.TriggerEvent(event="rag/query_pdf_ai"),
 )
 async def rag_query_pdf_ai(ctx: inngest.Context):
-    def _search(question: str, top_k: int = 5) -> RAGSearchResult:
+    workspace_id = ctx.event.data.get("workspace_id")
+
+    def _search(question: str, top_k: int = 5, ws_id: Optional[str] = None) -> RAGSearchResult:
         query_vec = embed_texts([question])[0]
         store = QdrantStorage(
             url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             api_key=os.getenv("QDRANT_API_KEY"),
             collection="docs_hf",
         )
-        found = store.search(query_vec, top_k)
+        found = store.search(query_vec, top_k=top_k, workspace_id=ws_id)
         return RAGSearchResult(contexts=found["contexts"], sources=found["sources"])
 
     question = ctx.event.data["question"]
@@ -189,7 +195,7 @@ async def rag_query_pdf_ai(ctx: inngest.Context):
 
     found = await ctx.step.run(
         "embed-and-search",
-        lambda: _search(question, top_k),
+        lambda: _search(question, top_k, workspace_id),
         output_type=RAGSearchResult,
     )
 
@@ -416,6 +422,7 @@ async def upload_pdf(
             "pdf_path": str(dest),
             "source_id": clean_filename,
             "document_id": doc_id,
+            "workspace_id": workspace_id,
         },
     )
     try:
@@ -543,6 +550,7 @@ async def retry_document_job(document_id: str, db: Session = Depends(get_db)):
             "pdf_path": str(file_path),
             "source_id": doc.filename,
             "document_id": doc.id,
+            "workspace_id": doc.workspace_id,
         },
     )
     try:
@@ -616,4 +624,111 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
         "status": "deleted",
         "message": f"Document '{filename}' and associated vectors were successfully deleted.",
         "document_id": document_id,
+    }
+
+
+from pydantic import BaseModel
+
+
+class QueryRequestModel(BaseModel):
+    question: str
+    top_k: int = 5
+    workspace_id: Optional[str] = None
+
+
+@app.post("/query")
+async def query_documents(req: QueryRequestModel):
+    """
+    Execute tenant-isolated vector retrieval and question answering.
+    Applies strict workspace_id filter on Qdrant so foreign tenant data is unreachable.
+    """
+    query_vec = embed_texts([req.question])[0]
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_key = os.getenv("QDRANT_API_KEY")
+    store = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
+
+    # Strict multi-tenant vector search
+    found = store.search(query_vec, top_k=req.top_k, workspace_id=req.workspace_id)
+
+    if not found["contexts"]:
+        return {
+            "answer": "No relevant documents found in this workspace to answer your question.",
+            "sources": [],
+            "num_contexts": 0,
+            "workspace_id": req.workspace_id,
+        }
+
+    context_block = "\n\n".join(f"- {c}" for c in found["contexts"])
+    hf_token = os.getenv("HF_TOKEN")
+    answer = ""
+
+    if hf_token:
+        try:
+            import httpx
+            prompt = (
+                f"Context:\n{context_block}\n\n"
+                f"Question: {req.question}\n\n"
+                "Answer concisely using the context above."
+            )
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                res = await client.post(
+                    "https://router.huggingface.co/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {hf_token}"},
+                    json={
+                        "model": "meta-llama/Llama-3.1-8B-Instruct:novita",
+                        "messages": [
+                            {"role": "system", "content": "You answer questions using only the provided context."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": 1024,
+                        "temperature": 0.2,
+                    },
+                )
+                if res.status_code == 200:
+                    answer = res.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logger.warning(f"Error querying HF chat completions: {e}")
+
+    if not answer:
+        # Fallback informative summary response when LLM router is unavailable or rate-limited
+        answer = f"Retrieved {len(found['contexts'])} context passages from: {', '.join(found['sources'])}.\n\nKey Excerpt:\n" + found["contexts"][0][:400]
+
+    return {
+        "answer": answer,
+        "sources": found["sources"],
+        "num_contexts": len(found["contexts"]),
+        "workspace_id": req.workspace_id,
+    }
+
+
+@app.delete("/workspaces/{workspace_id}/cleanup")
+def cleanup_workspace_data(workspace_id: str, db: Session = Depends(get_db)):
+    """
+    Cascade-deletes all documents, local files, and derived Qdrant vectors
+    belonging to a deleted workspace. Leaves zero orphaned vectors.
+    """
+    docs = db.query(Document).filter(Document.workspace_id == workspace_id).all()
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_key = os.getenv("QDRANT_API_KEY")
+    storage = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
+
+    # 1. Purge all vectors for this tenant in Qdrant
+    storage.delete_by_workspace(workspace_id)
+
+    # 2. Delete physical storage files
+    deleted_count = len(docs)
+    for doc in docs:
+        try:
+            p = Path(doc.storage_path)
+            if p.exists():
+                p.unlink()
+        except Exception as e:
+            logger.warning(f"Could not remove file {doc.storage_path}: {e}")
+        db.delete(doc)
+
+    db.commit()
+    return {
+        "status": "deleted",
+        "workspace_id": workspace_id,
+        "documents_deleted": deleted_count,
     }

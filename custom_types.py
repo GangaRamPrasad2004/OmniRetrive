@@ -6,12 +6,14 @@ class RAGChunksAndSrc(pydantic.BaseModel):
     chunks: List[str]
     source_id: Optional[str] = None
     document_id: Optional[str] = None
+    workspace_id: Optional[str] = "default_workspace"
     page_count: Optional[int] = 0
 
 
 class RAGUpsertResult(pydantic.BaseModel):
     ingested: int
     document_id: Optional[str] = None
+    workspace_id: Optional[str] = None
 
 
 class RAGSearchResult(pydantic.BaseModel):

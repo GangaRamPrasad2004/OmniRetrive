@@ -1,4 +1,5 @@
 import logging
+from typing import Optional, List, Dict, Any
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams,
@@ -28,20 +29,39 @@ class QdrantStorage:
         except Exception as e:
             logger.warning(f"Could not connect or initialize Qdrant collection '{collection}': {e}")
 
-    def upsert(self, ids, vectors, payloads):
+    def upsert(self, ids: List[str], vectors: List[List[float]], payloads: List[Dict[str, Any]]):
         points = [
             PointStruct(id=ids[i], vector=vectors[i], payload=payloads[i])
             for i in range(len(ids))
         ]
         return self.client.upsert(self.collection, points=points)
 
-    def search(self, query_vector, top_k: int = 5):
-        results = self.client.query_points(
-            collection_name=self.collection,
-            query=query_vector,
-            with_payload=True,
-            limit=top_k,
-        )
+    def search(self, query_vector: List[float], top_k: int = 5, workspace_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Performs vector search in Qdrant.
+        When workspace_id is provided, applies a strict tenant-isolation filter
+        so vectors from other workspaces can never be retrieved.
+        """
+        query_filter = None
+        if workspace_id:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
+                ]
+            )
+
+        try:
+            results = self.client.query_points(
+                collection_name=self.collection,
+                query=query_vector,
+                query_filter=query_filter,
+                with_payload=True,
+                limit=top_k,
+            )
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}")
+            return {"contexts": [], "sources": []}
+
         contexts = []
         sources = set()
 
@@ -74,4 +94,25 @@ class QdrantStorage:
             return True
         except Exception as e:
             logger.error(f"Failed to delete vectors for source '{source_id}': {e}")
+            return False
+
+    def delete_by_workspace(self, workspace_id: str) -> bool:
+        """
+        Deletes all vector points belonging to a specific workspace.
+        Ensures workspace deletion leaves zero orphaned vectors in Qdrant.
+        """
+        try:
+            filter_condition = Filter(
+                must=[
+                    FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
+                ]
+            )
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=FilterSelector(filter=filter_condition),
+            )
+            logger.info(f"Successfully deleted all vectors for workspace '{workspace_id}' from Qdrant.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete vectors for workspace '{workspace_id}': {e}")
             return False
