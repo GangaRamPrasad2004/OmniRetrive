@@ -35,7 +35,7 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application source
-COPY main.py data_loader.py vector_db.py custom_types.py ./
+COPY main.py data_loader.py vector_db.py custom_types.py database.py file_utils.py ./
 
 # Create uploads directory (PDFs uploaded by users land here)
 RUN mkdir -p /app/uploads
