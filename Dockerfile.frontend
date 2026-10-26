@@ -1,44 +1,14 @@
-# ── Stage 1: Builder ──────────────────────────────────────────────────────────
-FROM python:3.13-slim AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
+COPY frontend-react/package*.json ./
+RUN npm ci
+COPY frontend-react/ ./
+RUN npm run build
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libpoppler-cpp-dev \
-    poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# Copy dependency files first (better layer caching)
-COPY pyproject.toml uv.lock ./
-
-# Create venv and install deps (no dev deps, frozen to lockfile)
-ENV UV_PROJECT_ENVIRONMENT=/opt/venv
-RUN uv sync --frozen --no-dev --no-install-project
-
-# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM python:3.13-slim AS runtime
-
-WORKDIR /app
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    poppler-utils \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy the venv built in the builder stage
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy only the files the frontend needs
-COPY frontend.py ./
-
-RUN mkdir -p /app/uploads
-
-# Streamlit default port
-ENV PORT=8501
-EXPOSE 8501
-
-CMD ["sh", "-c", "streamlit run frontend.py --server.port=${PORT} --server.address=0.0.0.0 --server.headless=true"]
+FROM nginx:1.29-alpine
+COPY frontend-react/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD wget -qO- http://127.0.0.1/health >/dev/null || exit 1

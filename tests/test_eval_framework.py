@@ -147,6 +147,21 @@ class TestModelBasedMetrics:
 # 3. REPEATABLE RUNNER & EXPERIMENT COMPARISON
 # ─────────────────────────────────────────────────────────────────────────────
 class TestEvalRunnerAndComparison:
+    @patch("eval.runner.embed_texts", side_effect=RuntimeError("provider unavailable"))
+    @patch("eval.runner.QdrantStorage")
+    def test_embedding_failure_aborts_instead_of_scoring_zero_vector(
+        self, mock_storage_cls, mock_embed
+    ):
+        runner = EvalRunner(workspace_id="workspace-1")
+
+        with pytest.raises(RuntimeError, match="Embedding failed for evaluation query"):
+            runner.run_evaluation(
+                dataset=[{"id": "offline-query", "query": "Test query"}],
+                save_to_db=False,
+            )
+
+        mock_storage_cls.return_value.search.assert_not_called()
+
     @patch("eval.runner.embed_texts")
     @patch("eval.runner.QdrantStorage")
     def test_run_evaluation_end_to_end(self, mock_storage_cls, mock_embed, eval_test_env):

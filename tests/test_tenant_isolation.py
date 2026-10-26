@@ -7,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import Base, get_db, Document
+from storage import LocalDocumentStorage
 from vector_db import QdrantStorage
 from main import app
 
@@ -28,7 +29,9 @@ def tenant_test_env():
 
     app.dependency_overrides[get_db] = override_get_db
 
-    with patch("main.SessionLocal", TestingSessionLocal):
+    with patch("main.SessionLocal", TestingSessionLocal), patch(
+        "main.get_document_storage", return_value=LocalDocumentStorage(temp_dir)
+    ):
         client = TestClient(app)
         yield client, TestingSessionLocal, temp_dir
 
@@ -39,6 +42,18 @@ def tenant_test_env():
 # 1. VECTOR DB MULTI-TENANT ISOLATION TESTS
 # ─────────────────────────────────────────────────────────────────────────────
 class TestQdrantTenantIsolation:
+    @patch("vector_db.QdrantClient")
+    def test_search_without_workspace_is_rejected(self, mock_client_cls):
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.collection_exists.return_value = True
+        storage = QdrantStorage(url="http://mock:6333", collection="docs_hf")
+
+        with pytest.raises(ValueError, match="workspace_id is required"):
+            storage.search([0.1] * 768, top_k=5)
+
+        mock_client.query_points.assert_not_called()
+
     @patch("vector_db.QdrantClient")
     def test_search_enforces_workspace_filter(self, mock_client_cls):
         mock_client = MagicMock()
@@ -94,7 +109,22 @@ class TestQdrantTenantIsolation:
 class TestTenantAPIEndpoints:
     @patch("main.QdrantStorage")
     def test_query_documents_passes_workspace_id(self, mock_storage_cls, tenant_test_env):
-        client, _, _ = tenant_test_env
+        client, SessionLocal, _ = tenant_test_env
+        db = SessionLocal()
+        db.add(
+            Document(
+                id="doc-alpha-query",
+                filename="alpha_doc.pdf",
+                file_hash="alpha-query-hash",
+                file_size=10,
+                storage_path="workspaces/ws-alpha-123/documents/doc-alpha-query/versions/1/original.pdf",
+                workspace_id="ws-alpha-123",
+                status="completed",
+                chunk_count=1,
+            )
+        )
+        db.commit()
+        db.close()
 
         mock_storage = MagicMock()
         mock_storage.search.return_value = {

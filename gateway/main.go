@@ -13,6 +13,7 @@ import (
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"golang.org/x/time/rate"
+	"strings"
 
 	"omniretrive/gateway/db"
 	"omniretrive/gateway/handlers"
@@ -30,15 +31,30 @@ func SetupRouter(database *db.DB) *chi.Mux {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(chimiddleware.Timeout(60 * time.Second))
 
-	// CORS Setup
+	// CORS Setup - origins from env var FRONTEND_ORIGINS (comma separated). Default to localhost dev origins.
+	originsEnv := os.Getenv("FRONTEND_ORIGINS")
+	var allowedOrigins []string
+	if originsEnv == "" {
+		allowedOrigins = []string{"http://localhost:3000"}
+	} else {
+		for _, o := range strings.Split(originsEnv, ",") {
+			trimmed := strings.TrimSpace(o)
+			if trimmed != "" {
+				allowedOrigins = append(allowedOrigins, trimmed)
+			}
+		}
+	}
+
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"*"},
+		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
+	// Security headers middleware
+	r.Use(middleware.SecurityHeaders)
 
 	// Rate Limiters
 	authLimiter := middleware.NewIPRateLimiter(rate.Limit(5), 10)  // 5 req/sec, burst 10
@@ -104,6 +120,10 @@ func SetupRouter(database *db.DB) *chi.Mux {
 				// Document Details (Any member)
 				r.With(middleware.WorkspaceRBAC(database, models.RoleMember)).
 					Get("/{docId}", proxyH.GetDocument)
+
+				// Original document download (Any member)
+				r.With(middleware.WorkspaceRBAC(database, models.RoleMember)).
+					Get("/{docId}/download", proxyH.DownloadDocument)
 
 				// Retry Ingestion (Any member)
 				r.With(middleware.WorkspaceRBAC(database, models.RoleMember)).

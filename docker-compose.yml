@@ -1,14 +1,42 @@
-version: "3.8"
-
 services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: omniretrive-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-omniretrive}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before starting}
+      - POSTGRES_DB=${POSTGRES_DB:-omniretrive}
+    volumes:
+      - identity-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   qdrant:
     image: qdrant/qdrant:latest
     container_name: omniretrive-qdrant
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
     volumes:
       - ./qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  inngest:
+    image: inngest/inngest:latest
+    container_name: omniretrive-inngest
+    command: ["inngest", "dev", "-u", "http://ai-backend:8000/api/inngest"]
+    ports:
+      - "127.0.0.1:8288:8288"
+      - "127.0.0.1:8289:8289"
+    depends_on:
+      ai-backend:
+        condition: service_healthy
     restart: unless-stopped
 
   ai-backend:
@@ -16,19 +44,32 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     container_name: omniretrive-ai-backend
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     environment:
       - PORT=8000
       - UPLOADS_DIR=/app/uploads
       - QDRANT_URL=http://qdrant:6333
       - QDRANT_API_KEY=${QDRANT_API_KEY:-}
       - HF_TOKEN=${HF_TOKEN:-}
-      - IS_PRODUCTION=true
-    depends_on:
-      - qdrant
+      - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-50}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+      - STORAGE_LOCAL_ROOT=/app/uploads
+      - STORAGE_BUCKET=${STORAGE_BUCKET:-}
+      - STORAGE_REGION=${STORAGE_REGION:-}
+      - STORAGE_ENDPOINT_URL=${STORAGE_ENDPOINT_URL:-}
+      - STORAGE_ACCESS_KEY_ID=${STORAGE_ACCESS_KEY_ID:-}
+      - STORAGE_SECRET_ACCESS_KEY=${STORAGE_SECRET_ACCESS_KEY:-}
+      - SQLITE_PATH=/app/data/omniretrive.db
+      - OBSERVABILITY_SERVICE_URL=http://observability:8082
+      - IS_PRODUCTION=${IS_PRODUCTION:-false}
+      - INNGEST_DEV=http://inngest:8288
     volumes:
       - ./uploads:/app/uploads
+      - ai-metadata:/app/data
+    depends_on:
+      qdrant:
+        condition: service_started
     restart: unless-stopped
 
   gateway:
@@ -37,16 +78,28 @@ services:
       dockerfile: Dockerfile.gateway
     container_name: omniretrive-gateway
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       - PORT=8080
       - AI_SERVICE_URL=http://ai-backend:8000
-      - GATEWAY_DB_PATH=/app/gateway.db
-      - JWT_SECRET=${JWT_SECRET:-omniretrive-production-secret-min32characters-key}
+      - JWT_SECRET=${JWT_SECRET:?Set a secure JWT_SECRET before starting}
+      - DATABASE_URL=${DATABASE_URL:-}
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=${POSTGRES_USER:-omniretrive}
+      - PGPASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before starting}
+      - PGDATABASE=${POSTGRES_DB:-omniretrive}
+      - PGSSLMODE=disable
+      - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-50}
+      - GATEWAY_SQLITE_IMPORT_PATH=/legacy/gateway.db
+      - FRONTEND_ORIGINS=${FRONTEND_ORIGINS:-http://localhost:3000}
     depends_on:
-      - ai-backend
+      postgres:
+        condition: service_healthy
+      ai-backend:
+        condition: service_healthy
     volumes:
-      - gateway-data:/app
+      - gateway-data:/legacy:ro
     restart: unless-stopped
 
   frontend:
@@ -55,31 +108,38 @@ services:
       dockerfile: Dockerfile.frontend
     container_name: omniretrive-frontend
     ports:
-      - "8501:8501"
-    environment:
-      - PORT=8501
-      - GATEWAY_URL=http://gateway:8080
-      - BACKEND_URL=http://ai-backend:8000
-      - INNGEST_API_BASE=${INNGEST_API_BASE:-http://127.0.0.1:8288/v1}
+      - "127.0.0.1:3000:80"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
   observability:
     build:
       context: .
       dockerfile: Dockerfile.observability
     container_name: omniretrive-observability
     ports:
-      - "8082:8082"
+      - "127.0.0.1:8082:8082"
     environment:
       - PORT=8082
-      - DATABASE_PATH=/app/omniretrive.db
+      - DATABASE_PATH=/app/data/omniretrive.db
       - QDRANT_URL=http://qdrant:6333
       - BACKEND_URL=http://ai-backend:8000
       - GATEWAY_URL=http://gateway:8080
       - UPLOADS_DIR=/app/uploads
     depends_on:
-      - qdrant
-      - ai-backend
-      - gateway
+      qdrant:
+        condition: service_started
+      ai-backend:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    volumes:
+      - observability-data:/app/data
     restart: unless-stopped
 
 volumes:
   gateway-data:
+  identity-data:
+  ai-metadata:
+  observability-data:

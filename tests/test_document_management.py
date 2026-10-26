@@ -11,8 +11,9 @@ from pypdf import PdfWriter
 from pathlib import Path
 
 from database import Base, get_db, Document, DocumentJob
-from file_utils import validate_pdf_file, compute_sha256, sanitize_filename
+from file_utils import validate_pdf_file, validate_pdf_path, compute_sha256, sanitize_filename
 from main import app, _update_doc_status
+from storage import LocalDocumentStorage
 
 
 def create_blank_pdf(pages: int = 1) -> bytes:
@@ -47,6 +48,7 @@ def test_env():
     # Patch SessionLocal in main and database so background helpers use test db
     with patch("main.SessionLocal", TestingSessionLocal), \
          patch("main.UPLOADS_DIR", Path(temp_dir)), \
+         patch("main.get_document_storage", return_value=LocalDocumentStorage(temp_dir)), \
          patch("main.inngest_client.send", return_value=["test-event-id-123"]), \
          patch("main.QdrantStorage") as mock_qdrant:
 
@@ -108,6 +110,14 @@ class TestFileUtilsAndValidation:
         assert valid is False
         assert "exceeds maximum allowed limit" in err.lower()
 
+    def test_validate_pdf_from_disk(self, tmp_path):
+        pdf_path = tmp_path / "large.pdf"
+        pdf_path.write_bytes(create_blank_pdf())
+        valid, error, page_count = validate_pdf_path("large.pdf", pdf_path)
+        assert valid is True
+        assert error == ""
+        assert page_count == 1
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. DOCUMENT MANAGEMENT API ENDPOINTS
@@ -158,6 +168,60 @@ class TestDocumentAPI:
         )
         assert resp.status_code == 400
         assert "expected '.pdf'" in resp.json()["detail"].lower()
+
+    def test_upload_marks_document_failed_when_worker_rejects_event(self, test_env):
+        client, SessionLocal, _ = test_env
+        pdf_bytes = create_blank_pdf()
+
+        with patch("main.inngest_client.send", side_effect=RuntimeError("worker offline")):
+            response = client.post(
+                "/upload",
+                files={"file": ("dispatch_failure.pdf", pdf_bytes, "application/pdf")},
+                data={"workspace_id": "ws-dispatch-failure", "owner_id": "user-1"},
+            )
+
+        assert response.status_code == 503
+        db = SessionLocal()
+        document = db.query(Document).filter(Document.filename == "dispatch_failure.pdf").one()
+        job = db.query(DocumentJob).filter(DocumentJob.document_id == document.id).one()
+        assert document.status == "failed"
+        assert job.status == "failed"
+        assert job.error_message
+        db.close()
+
+    def test_upload_marks_document_failed_when_storage_is_unavailable(self, test_env):
+        client, SessionLocal, _ = test_env
+        with patch("main.get_document_storage") as mock_storage_factory:
+            mock_storage_factory.return_value.put_file.side_effect = OSError("storage offline")
+            response = client.post(
+                "/upload",
+                files={"file": ("storage_failure.pdf", create_blank_pdf(), "application/pdf")},
+                data={"workspace_id": "ws-storage-failure", "owner_id": "user-1"},
+            )
+
+        assert response.status_code == 503
+        db = SessionLocal()
+        document = db.query(Document).filter(Document.filename == "storage_failure.pdf").one()
+        assert document.status == "failed"
+        assert "storage failed" in document.error_message.lower()
+        assert db.query(DocumentJob).filter(DocumentJob.document_id == document.id).count() == 0
+        db.close()
+
+    def test_download_returns_private_original_pdf(self, test_env):
+        client, _, _ = test_env
+        pdf_bytes = create_blank_pdf(pages=2)
+        uploaded = client.post(
+            "/upload",
+            files={"file": ("downloadable.pdf", pdf_bytes, "application/pdf")},
+            data={"workspace_id": "ws-download", "owner_id": "user-1"},
+        )
+        document_id = uploaded.json()["document"]["id"]
+
+        downloaded = client.get(f"/documents/{document_id}/download")
+
+        assert downloaded.status_code == 200
+        assert downloaded.headers["content-type"] == "application/pdf"
+        assert downloaded.content == pdf_bytes
 
     def test_duplicate_prevention_completed(self, test_env):
         client, SessionLocal, _ = test_env
@@ -297,9 +361,12 @@ class TestDocumentAPI:
         pdf_bytes = create_blank_pdf(pages=1)
         resp = client.post("/upload", files={"file": ("delete_me.pdf", pdf_bytes, "application/pdf")})
         doc_id = resp.json()["document"]["id"]
-        storage_path = resp.json()["document"]["storage_path"]
-
-        assert os.path.exists(storage_path)
+        assert "storage_path" not in resp.json()["document"]
+        db = SessionLocal()
+        stored_key = db.query(Document).filter(Document.id == doc_id).one().storage_path
+        db.close()
+        storage = LocalDocumentStorage(test_env[2])
+        assert storage.exists(stored_key)
 
         # Delete document
         resp_del = client.delete(f"/documents/{doc_id}")
@@ -307,7 +374,7 @@ class TestDocumentAPI:
         assert resp_del.json()["status"] == "deleted"
 
         # Verify file is deleted from disk
-        assert not os.path.exists(storage_path)
+        assert not storage.exists(stored_key)
 
         # Verify DB record deleted
         db = SessionLocal()
@@ -318,6 +385,55 @@ class TestDocumentAPI:
 
         # Subsequent GET is 404
         assert client.get(f"/documents/{doc_id}").status_code == 404
+
+    def test_document_deletion_can_retry_after_storage_cleanup_failure(self, test_env):
+        client, SessionLocal, temp_dir = test_env
+        storage = LocalDocumentStorage(temp_dir)
+        source = Path(temp_dir) / "retry-delete.pdf"
+        source.write_bytes(b"%PDF-1.4 retry deletion")
+        key = "workspaces/ws-retry-delete/documents/doc-retry-delete/versions/1/original.pdf"
+        storage.put_file(key, source, compute_sha256(source.read_bytes()))
+        db = SessionLocal()
+        db.add(
+            Document(
+                id="doc-retry-delete",
+                filename="retry-delete.pdf",
+                file_hash="retry-delete-hash",
+                file_size=source.stat().st_size,
+                storage_path=key,
+                workspace_id="ws-retry-delete",
+                status="completed",
+                chunk_count=1,
+                page_count=1,
+            )
+        )
+        db.commit()
+        db.close()
+
+        original_delete = storage.delete
+        delete_attempts = 0
+
+        def fail_first_delete(storage_key):
+            nonlocal delete_attempts
+            delete_attempts += 1
+            if delete_attempts == 1:
+                raise OSError("storage temporarily unavailable")
+            original_delete(storage_key)
+
+        with patch("main.get_document_storage", return_value=storage), patch.object(
+            storage, "delete", side_effect=fail_first_delete
+        ):
+            first_attempt = client.delete("/documents/doc-retry-delete")
+            assert first_attempt.status_code == 503
+            assert client.get("/documents/doc-retry-delete").status_code == 404
+
+            second_attempt = client.delete("/documents/doc-retry-delete")
+
+        assert second_attempt.status_code == 200
+        assert not storage.exists(key)
+        db = SessionLocal()
+        assert db.query(Document).filter(Document.id == "doc-retry-delete").first() is None
+        db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +454,13 @@ class TestPipelineFailureAndReadiness:
             page_count=1,
         )
         db.add(doc)
+        db.add(
+            DocumentJob(
+                id="job-test-helper",
+                document_id="doc-test-helper",
+                status="queued",
+            )
+        )
         db.commit()
         db.close()
 
@@ -357,6 +480,14 @@ class TestPipelineFailureAndReadiness:
         assert d.status == "failed"
         assert d.error_message == "Embedding model unavailable"
         assert d.to_dict()["is_ready_for_qa"] is False
+        db.add(
+            DocumentJob(
+                id="job-retry-helper",
+                document_id="doc-test-helper",
+                status="queued",
+            )
+        )
+        db.commit()
         db.close()
 
         # Simulate successful completion
@@ -366,6 +497,42 @@ class TestPipelineFailureAndReadiness:
         assert d.status == "completed"
         assert d.error_message is None
         assert d.to_dict()["is_ready_for_qa"] is True
+        failed_job = db.query(DocumentJob).filter(DocumentJob.id == "job-test-helper").one()
+        job = db.query(DocumentJob).filter(DocumentJob.id == "job-retry-helper").one()
+        assert failed_job.status == "failed"
+        assert job.status == "completed"
+        db.close()
+
+    @patch("main.QdrantStorage")
+    def test_delete_retains_document_when_vector_cleanup_fails(self, mock_storage_cls, test_env):
+        client, SessionLocal, temp_dir = test_env
+        storage_path = Path(temp_dir) / "retained.pdf"
+        storage_path.write_bytes(b"%PDF-1.4 retained")
+        db = SessionLocal()
+        doc = Document(
+            id="doc-delete-failure",
+            filename="retained.pdf",
+            file_hash="delete-failure-hash",
+            file_size=17,
+            storage_path=str(storage_path),
+            workspace_id="ws-delete-failure",
+            status="completed",
+            chunk_count=1,
+            page_count=1,
+        )
+        db.add(doc)
+        db.commit()
+        db.close()
+
+        mock_storage_cls.return_value.delete_by_source.return_value = False
+        response = client.delete("/documents/doc-delete-failure")
+
+        assert response.status_code == 503
+        assert storage_path.exists()
+        db = SessionLocal()
+        retained_doc = db.query(Document).filter(Document.id == "doc-delete-failure").one()
+        assert retained_doc.status == "deleting"
+        assert client.get("/documents/doc-delete-failure").status_code == 404
         db.close()
 
 
@@ -396,4 +563,3 @@ class TestQdrantStorage:
         storage = QdrantStorage(url="http://mock:6333", collection="test_col")
         success = storage.delete_by_source("doc-12345")
         assert success is False
-

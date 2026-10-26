@@ -3,13 +3,17 @@ import uuid
 import logging
 import datetime
 import time
+import hashlib
+import tempfile
 from pathlib import Path
 from typing import Optional, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, Query, HTTPException, Depends, status, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, asc
 
@@ -18,9 +22,10 @@ from inngest.experimental import ai
 import inngest.fast_api
 
 from database import init_db, get_db, SessionLocal, Document, DocumentJob, EvalRun, EvalItemResult
-from file_utils import validate_pdf_file, compute_sha256, sanitize_filename
+from file_utils import DEFAULT_MAX_FILE_SIZE, validate_pdf_path, sanitize_filename
 from data_loader import load_and_chunk_pdf, load_and_chunk_pdf_with_metadata, embed_texts
 from vector_db import QdrantStorage
+from storage import document_storage_key, get_document_storage
 from eval.runner import EvalRunner, compare_runs
 from custom_types import (
     RAGChunksAndSrc,
@@ -65,7 +70,7 @@ def _update_doc_status(
         doc = db.query(Document).filter(Document.id == doc_id).first()
         if doc:
             # If document was cancelled, do not overwrite cancelled state
-            if doc.status == "cancelled" and status_val != "cancelled":
+            if doc.status in ("cancelled", "deleting") and status_val not in ("cancelled", "deleting"):
                 return
             doc.status = status_val
             if error_msg is not None:
@@ -76,6 +81,30 @@ def _update_doc_status(
                 doc.chunk_count = chunk_count
             if page_count is not None and page_count > 0:
                 doc.page_count = page_count
+            if status_val == "completed":
+                doc.last_processed_at = datetime.datetime.now(datetime.timezone.utc)
+            job_status = {
+                "processing": "processing",
+                "completed": "completed",
+                "failed": "failed",
+                "cancelled": "cancelled",
+            }.get(status_val)
+            if job_status:
+                active_jobs = (
+                    db.query(DocumentJob)
+                    .filter(
+                        DocumentJob.document_id == doc_id,
+                        DocumentJob.status.in_(["queued", "processing", "retrying"]),
+                    )
+                    .all()
+                )
+                for job in active_jobs:
+                    job.status = job_status
+                    job.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                    if error_msg is not None:
+                        job.error_message = error_msg
+                    elif job_status in ("processing", "completed"):
+                        job.error_message = None
             doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
             db.commit()
     except Exception as e:
@@ -83,6 +112,56 @@ def _update_doc_status(
         db.rollback()
     finally:
         db.close()
+
+
+async def _queue_ingestion(db: Session, doc: Document, job_type: str) -> Optional[str]:
+    event = inngest.Event(
+        name="rag/ingest_pdf",
+        data={
+            "pdf_path": doc.storage_path,
+            "source_id": doc.filename,
+            "document_id": doc.id,
+            "workspace_id": doc.workspace_id,
+        },
+    )
+    try:
+        event_ids = await inngest_client.send(event)
+        if not event_ids:
+            raise RuntimeError("Background worker did not acknowledge the event.")
+        event_id = event_ids[0]
+    except Exception as exc:
+        message = "Background processing service did not accept the job. Retry the document."
+        doc.status = "failed"
+        doc.error_message = message
+        doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        db.add(
+            DocumentJob(
+                id=str(uuid.uuid4()),
+                document_id=doc.id,
+                job_type=job_type,
+                status="failed",
+                error_message=message,
+            )
+        )
+        db.commit()
+        logger.error(
+            "Background ingestion dispatch failed",
+            exc_info=True,
+            extra={"document_id": doc.id, "workspace_id": doc.workspace_id},
+        )
+        raise HTTPException(status_code=503, detail=message) from exc
+
+    db.add(
+        DocumentJob(
+            id=str(uuid.uuid4()),
+            document_id=doc.id,
+            job_type=job_type,
+            status="queued",
+            event_id=event_id,
+        )
+    )
+    db.commit()
+    return event_id
 
 
 @inngest_client.create_function(
@@ -116,7 +195,6 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             "document_id": document_id,
             "job_id": job_id,
             "workspace_id": workspace_id,
-            "pdf_path": pdf_path,
         },
     )
 
@@ -128,13 +206,18 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             db_chk = SessionLocal()
             try:
                 curr_doc = db_chk.query(Document).filter(Document.id == document_id).first()
-                if curr_doc and curr_doc.status == "cancelled":
-                    logger.info(f"Document {document_id} was cancelled before loading.")
+                if not curr_doc or curr_doc.status in ("cancelled", "deleting"):
+                    logger.info("Document ingestion stopped before loading", extra={"document_id": document_id})
                     return RAGChunksAndSrc(chunks=[], source_id=source_id, document_id=document_id, workspace_id=workspace_id)
             finally:
                 db_chk.close()
+        local_pdf = None
         try:
-            rich_chunks = load_and_chunk_pdf_with_metadata(pdf_path)
+            storage = get_document_storage()
+            with tempfile.NamedTemporaryFile(prefix="omniretrive-ingest-", suffix=".pdf", delete=False) as staged:
+                local_pdf = Path(staged.name)
+            storage.download_to_file(pdf_path, local_pdf)
+            rich_chunks = load_and_chunk_pdf_with_metadata(str(local_pdf))
             chunks = [c["text"] for c in rich_chunks]
             _update_doc_status(document_id, "processing", chunk_count=len(chunks))
             return RAGChunksAndSrc(
@@ -148,6 +231,9 @@ async def rag_ingest_pdf(ctx: inngest.Context):
             error_details = f"Text extraction failed: {str(e)}"
             _update_doc_status(document_id, "failed", error_msg=error_details)
             raise RuntimeError(error_details) from e
+        finally:
+            if local_pdf is not None:
+                local_pdf.unlink(missing_ok=True)
 
     def _upsert(chunks_and_src: RAGChunksAndSrc) -> RAGUpsertResult:
         try:
@@ -162,8 +248,8 @@ async def rag_ingest_pdf(ctx: inngest.Context):
                 db_chk = SessionLocal()
                 try:
                     curr_doc = db_chk.query(Document).filter(Document.id == doc_id).first()
-                    if curr_doc and curr_doc.status == "cancelled":
-                        logger.info(f"Document {doc_id} was cancelled before embedding/upsert.")
+                    if not curr_doc or curr_doc.status in ("cancelled", "deleting"):
+                        logger.info("Document ingestion stopped before embedding", extra={"document_id": doc_id})
                         return RAGUpsertResult(ingested=0, document_id=doc_id, workspace_id=ws_id)
                 finally:
                     db_chk.close()
@@ -188,6 +274,7 @@ async def rag_ingest_pdf(ctx: inngest.Context):
                     "chunk_index": i,
                     "page_number": chunk_meta[i].get("page_number", 1) if i < len(chunk_meta) else 1,
                     "heading": chunk_meta[i].get("heading") if i < len(chunk_meta) else None,
+                    "document_version": 1,
                 }
                 for i in range(len(chunks))
             ]
@@ -205,6 +292,17 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 
             # Batched upsert to handle large documents without timeouts
             storage.upsert(ids, vecs, payloads, batch_size=64)
+
+            if doc_id:
+                db_chk = SessionLocal()
+                try:
+                    curr_doc = db_chk.query(Document).filter(Document.id == doc_id).first()
+                    if not curr_doc or curr_doc.status in ("cancelled", "deleting"):
+                        if not storage.delete_by_source(doc_id):
+                            raise RuntimeError("Could not remove vectors for a cancelled document job.")
+                        return RAGUpsertResult(ingested=0, document_id=doc_id, workspace_id=ws_id)
+                finally:
+                    db_chk.close()
 
             _update_doc_status(doc_id, "completed", chunk_count=len(chunks))
             return RAGUpsertResult(ingested=len(chunks), document_id=doc_id)
@@ -333,17 +431,38 @@ def recover_interrupted_jobs():
     """Recovers any ingestion jobs left in-flight after an unexpected application crash or restart."""
     db: Session = SessionLocal()
     try:
-        interrupted_docs = db.query(Document).filter(Document.status.in_(["processing", "retrying"])).all()
+        pending_deletions = db.query(Document).filter(Document.status == "deleting").all()
+        for doc in pending_deletions:
+            try:
+                _finish_document_deletion(doc, db)
+            except HTTPException:
+                logger.warning("Document cleanup remains pending after startup", extra={"document_id": doc.id})
+
+        interrupted_docs = db.query(Document).filter(
+            Document.status.in_(["uploading", "processing", "retrying"])
+        ).all()
         if interrupted_docs:
-            logger.warning(f"Found {len(interrupted_docs)} interrupted document ingestion jobs. Recovering...")
-            qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-            qdrant_key = os.getenv("QDRANT_API_KEY")
-            storage = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
+            logger.warning(f"Found {len(interrupted_docs)} interrupted document jobs. Recovering...")
+            qdrant_storage = None
             for doc in interrupted_docs:
+                interrupted_status = doc.status
+                if interrupted_status != "uploading":
+                    if qdrant_storage is None:
+                        qdrant_storage = QdrantStorage(
+                            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+                            api_key=os.getenv("QDRANT_API_KEY"),
+                            collection="docs_hf",
+                        )
+                    if not qdrant_storage.delete_by_source(doc.id):
+                        logger.error("Could not clear interrupted document vectors", extra={"document_id": doc.id})
+                        continue
                 doc.status = "failed"
-                doc.error_message = "Ingestion was interrupted by application restart. Safe to retry."
+                doc.error_message = (
+                    "Upload was interrupted by application restart. Re-upload the document to retry."
+                    if interrupted_status == "uploading"
+                    else "Ingestion was interrupted by application restart. Safe to retry."
+                )
                 doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
-                storage.delete_by_source(doc.id)
 
             interrupted_jobs = db.query(DocumentJob).filter(DocumentJob.status.in_(["processing", "queued"])).all()
             for j in interrupted_jobs:
@@ -506,27 +625,37 @@ async def upload_pdf(
         )
 
     clean_filename = sanitize_filename(file.filename)
-    contents = await file.read()
+    descriptor, temporary_name = tempfile.mkstemp(prefix="omniretrive-upload-", suffix=".pdf")
+    os.close(descriptor)
+    staged_path = Path(temporary_name)
+    digest = hashlib.sha256()
+    file_size = 0
+    try:
+        with staged_path.open("wb") as staged:
+            while block := await file.read(1024 * 1024):
+                file_size += len(block)
+                if file_size > DEFAULT_MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File exceeds the {DEFAULT_MAX_FILE_SIZE // (1024 * 1024)} MB upload limit.",
+                    )
+                digest.update(block)
+                staged.write(block)
 
-    # 1. Validation
-    is_valid, error_msg, page_count = validate_pdf_file(clean_filename, contents)
-    if not is_valid:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=error_msg,
+        is_valid, error_msg, page_count = await run_in_threadpool(
+            validate_pdf_path, clean_filename, staged_path
+        )
+        if not is_valid:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg)
+
+        file_hash = digest.hexdigest()
+        existing_doc = (
+            db.query(Document)
+            .filter(Document.file_hash == file_hash, Document.workspace_id == workspace_id)
+            .first()
         )
 
-    # 2. Duplicate Detection via SHA-256
-    file_hash = compute_sha256(contents)
-    existing_doc = (
-        db.query(Document)
-        .filter(Document.file_hash == file_hash, Document.workspace_id == workspace_id)
-        .first()
-    )
-
-    if existing_doc:
-        # If document already succeeded, prevent redundant re-processing
-        if existing_doc.status == "completed":
+        if existing_doc and existing_doc.status == "completed":
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content={
@@ -537,8 +666,7 @@ async def upload_pdf(
                     "event_id": None,
                 },
             )
-        # If currently queued, processing, or retrying, prevent duplicate jobs
-        if existing_doc.status in ("queued", "processing", "retrying"):
+        if existing_doc and existing_doc.status in ("queued", "processing", "retrying", "uploading"):
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
                 content={
@@ -549,127 +677,119 @@ async def upload_pdf(
                     "event_id": None,
                 },
             )
-        # If failed, reuse existing doc and transition to retrying
-        doc_id = existing_doc.id
-        dest = Path(existing_doc.storage_path)
-        dest.write_bytes(contents)
-        existing_doc.status = "retrying"
+        if existing_doc and existing_doc.status == "deleting":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This document is being deleted. Wait for cleanup to finish before uploading it again.",
+            )
+
+        doc_id = existing_doc.id if existing_doc else str(uuid.uuid4())
+        storage_key = document_storage_key(workspace_id, doc_id, 1)
+        if existing_doc:
+            existing_doc.storage_path = storage_key
+            existing_doc.filename = clean_filename
+            existing_doc.file_size = file_size
+            existing_doc.owner_id = owner_id
+            existing_doc.uploaded_by = owner_id
+            existing_doc.status = "uploading"
+            existing_doc.error_message = None
+            existing_doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            job_type = "retry"
+        else:
+            existing_doc = Document(
+                id=doc_id,
+                filename=clean_filename,
+                file_hash=file_hash,
+                file_size=file_size,
+                mime_type="application/pdf",
+                storage_path=storage_key,
+                owner_id=owner_id,
+                uploaded_by=owner_id,
+                workspace_id=workspace_id,
+                version=1,
+                status="uploading",
+                chunk_count=0,
+                page_count=page_count,
+                error_message=None,
+            )
+            db.add(existing_doc)
+            job_type = "ingest"
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Document metadata could not be saved. The upload was not queued.",
+            ) from exc
+
+        try:
+            storage = get_document_storage()
+            verified_size = await run_in_threadpool(
+                storage.put_file, storage_key, staged_path, file_hash
+            )
+        except Exception as exc:
+            db.rollback()
+            failed_doc = db.query(Document).filter(Document.id == doc_id).first()
+            if failed_doc:
+                failed_doc.status = "failed"
+                failed_doc.error_message = "Original file storage failed. Re-upload this document to retry."
+                failed_doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+                db.commit()
+            logger.error("Original document storage failed", exc_info=True, extra={"workspace_id": workspace_id})
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Private document storage is unavailable. The upload was not queued; retry the upload.",
+            ) from exc
+
+        existing_doc.file_size = verified_size
+        existing_doc.status = "retrying" if job_type == "retry" else "queued"
         existing_doc.error_message = None
         existing_doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
         db.commit()
 
-        # Fire Inngest ingest event
-        event = inngest.Event(
-            name="rag/ingest_pdf",
-            data={
-                "pdf_path": str(dest),
-                "source_id": clean_filename,
-                "document_id": doc_id,
-            },
-        )
-        try:
-            event_ids = await inngest_client.send(event)
-            event_id = event_ids[0] if event_ids else None
-        except Exception as e:
-            logger.warning(f"Failed to send Inngest event: {e}")
-            event_id = None
-
-        job = DocumentJob(
-            id=str(uuid.uuid4()),
-            document_id=doc_id,
-            job_type="retry",
-            status="queued",
-            event_id=event_id,
-        )
-        db.add(job)
-        db.commit()
-
+        event_id = await _queue_ingestion(db, existing_doc, job_type)
+        if job_type == "retry":
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={
+                    "status": "retrying",
+                    "message": f"Re-queued ingestion for previously failed document '{existing_doc.filename}'.",
+                    "document": existing_doc.to_dict(),
+                    "filename": clean_filename,
+                    "event_id": event_id,
+                },
+            )
         return JSONResponse(
-            status_code=status.HTTP_200_OK,
+            status_code=status.HTTP_201_CREATED,
             content={
-                "status": "retrying",
-                "message": f"Re-queued ingestion for previously failed document '{existing_doc.filename}'.",
+                "status": "queued",
+                "message": "Document uploaded successfully and queued for ingestion.",
                 "document": existing_doc.to_dict(),
                 "filename": clean_filename,
                 "event_id": event_id,
             },
         )
-
-    # 3. New Document Record Creation
-    doc_id = str(uuid.uuid4())
-    dest = UPLOADS_DIR / f"{doc_id}_{clean_filename}"
-    dest.write_bytes(contents)
-
-    doc = Document(
-        id=doc_id,
-        filename=clean_filename,
-        file_hash=file_hash,
-        file_size=len(contents),
-        mime_type="application/pdf",
-        storage_path=str(dest),
-        owner_id=owner_id,
-        workspace_id=workspace_id,
-        version=1,
-        status="queued",
-        chunk_count=0,
-        page_count=page_count,
-        error_message=None,
-    )
-    db.add(doc)
-    db.commit()
-
-    # 4. Trigger Inngest Event
-    event = inngest.Event(
-        name="rag/ingest_pdf",
-        data={
-            "pdf_path": str(dest),
-            "source_id": clean_filename,
-            "document_id": doc_id,
-            "workspace_id": workspace_id,
-        },
-    )
-    try:
-        event_ids = await inngest_client.send(event)
-        event_id = event_ids[0] if event_ids else None
-    except Exception as e:
-        logger.warning(f"Failed to send Inngest event: {e}")
-        event_id = None
-
-    job = DocumentJob(
-        id=str(uuid.uuid4()),
-        document_id=doc_id,
-        job_type="ingest",
-        status="queued",
-        event_id=event_id,
-    )
-    db.add(job)
-    db.commit()
-
-    return JSONResponse(
-        status_code=status.HTTP_201_CREATED,
-        content={
-            "status": "queued",
-            "message": "Document uploaded successfully and queued for ingestion.",
-            "document": doc.to_dict(),
-            "filename": clean_filename,
-            "event_id": event_id,
-        },
-    )
+    finally:
+        staged_path.unlink(missing_ok=True)
+        await file.close()
 
 
 @app.get("/documents")
 def list_documents(
     search: Optional[str] = Query(None, description="Search by document filename"),
-    status: Optional[str] = Query(None, description="Filter by status (queued, processing, completed, failed, retrying)"),
+    status: Optional[str] = Query(None, description="Filter by status (uploading, queued, processing, completed, failed, retrying)"),
     workspace_id: Optional[str] = Query(None, description="Filter by workspace ID"),
     sort_by: str = Query("created_at", description="Field to sort by (created_at, filename, file_size, status)"),
     sort_order: str = Query("desc", description="Sort order (asc, desc)"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
     Searchable, sortable listing of all documents with status and metadata.
     """
-    query = db.query(Document)
+    query = db.query(Document).filter(Document.status != "deleting")
 
     if workspace_id:
         query = query.filter(Document.workspace_id == workspace_id)
@@ -687,17 +807,24 @@ def list_documents(
     else:
         query = query.order_by(desc(sort_column))
 
-    docs = query.all()
+    total = query.count()
+    docs = query.offset(offset).limit(limit).all()
     return {
         "documents": [d.to_dict() for d in docs],
-        "total": len(docs),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
     }
 
 
 @app.get("/documents/{document_id}")
 def get_document_details(document_id: str, db: Session = Depends(get_db)):
     """Retrieve metadata, job states, and readiness for a specific document."""
-    doc = db.query(Document).filter(Document.id == document_id).first()
+    doc = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.status != "deleting")
+        .first()
+    )
     if not doc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -729,17 +856,24 @@ async def retry_document_job(document_id: str, db: Session = Depends(get_db)):
             detail=f"Document with ID '{document_id}' not found.",
         )
 
-    if doc.status == "processing":
+    if doc.status in ("uploading", "queued", "processing", "retrying"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Document '{doc.filename}' is already actively processing.",
+            detail=f"Document '{doc.filename}' already has an active ingestion job.",
         )
 
-    file_path = Path(doc.storage_path)
-    if not file_path.exists():
+    try:
+        original_exists = get_document_storage().exists(doc.storage_path)
+    except Exception as exc:
+        logger.error("Could not verify original document storage", exc_info=True, extra={"document_id": document_id})
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Stored PDF file not found on disk at: {doc.storage_path}. Please re-upload.",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document storage is temporarily unavailable. Retry later.",
+        ) from exc
+    if not original_exists:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The original document file is missing from storage. Re-upload the document before retrying.",
         )
 
     doc.status = "retrying"
@@ -747,31 +881,7 @@ async def retry_document_job(document_id: str, db: Session = Depends(get_db)):
     doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
     db.commit()
 
-    event = inngest.Event(
-        name="rag/ingest_pdf",
-        data={
-            "pdf_path": str(file_path),
-            "source_id": doc.filename,
-            "document_id": doc.id,
-            "workspace_id": doc.workspace_id,
-        },
-    )
-    try:
-        event_ids = await inngest_client.send(event)
-        event_id = event_ids[0] if event_ids else None
-    except Exception as e:
-        logger.warning(f"Failed to send Inngest event: {e}")
-        event_id = None
-
-    job = DocumentJob(
-        id=str(uuid.uuid4()),
-        document_id=doc.id,
-        job_type="retry",
-        status="queued",
-        event_id=event_id,
-    )
-    db.add(job)
-    db.commit()
+    event_id = await _queue_ingestion(db, doc, "retry")
 
     return {
         "status": "retrying",
@@ -779,6 +889,85 @@ async def retry_document_job(document_id: str, db: Session = Depends(get_db)):
         "document": doc.to_dict(),
         "event_id": event_id,
     }
+
+
+@app.get("/documents/{document_id}/download")
+def download_document(document_id: str, db: Session = Depends(get_db)):
+    """Download a private original document; the Go gateway verifies workspace access."""
+    doc = (
+        db.query(Document)
+        .filter(Document.id == document_id, Document.status != "deleting")
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix="omniretrive-download-", suffix=".pdf")
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        get_document_storage().download_to_file(doc.storage_path, temporary_path)
+    except FileNotFoundError as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="The original document file is not available.",
+        ) from exc
+    except Exception as exc:
+        temporary_path.unlink(missing_ok=True)
+        logger.error("Original document download failed", exc_info=True, extra={"document_id": document_id})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document storage is temporarily unavailable. Retry later.",
+        ) from exc
+
+    return FileResponse(
+        temporary_path,
+        media_type="application/pdf",
+        filename=doc.filename,
+        background=BackgroundTask(temporary_path.unlink, missing_ok=True),
+    )
+
+
+def _finish_document_deletion(doc: Document, db: Session) -> None:
+    doc_id = doc.id
+    doc.status = "deleting"
+    doc.error_message = "Document cleanup is pending."
+    doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    for job in db.query(DocumentJob).filter(
+        DocumentJob.document_id == doc_id,
+        DocumentJob.status.in_(["queued", "processing", "retrying"]),
+    ):
+        job.status = "cancelled"
+        job.error_message = "Document deletion requested."
+        job.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    db.commit()
+
+    try:
+        qdrant = QdrantStorage(
+            url=os.getenv("QDRANT_URL", "http://localhost:6333"),
+            api_key=os.getenv("QDRANT_API_KEY"),
+            collection="docs_hf",
+        )
+        if not qdrant.delete_by_source(doc_id) or not qdrant.delete_by_source(doc.filename):
+            raise RuntimeError("Qdrant did not confirm vector cleanup.")
+        get_document_storage().delete(doc.storage_path)
+    except Exception as exc:
+        db.rollback()
+        retained_doc = db.query(Document).filter(Document.id == doc_id).first()
+        if retained_doc:
+            retained_doc.status = "deleting"
+            retained_doc.error_message = "Cleanup failed. Retry document deletion."
+            retained_doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+            db.commit()
+        logger.error("Document deletion cleanup failed", exc_info=True, extra={"document_id": doc_id})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document cleanup is pending. The document is unavailable and deletion can be retried.",
+        ) from exc
+
+    db.delete(doc)
+    db.commit()
 
 
 @app.delete("/documents/{document_id}")
@@ -795,33 +984,7 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
         )
 
     filename = doc.filename
-    storage_path = doc.storage_path
-
-    # 1. Delete derived vector points from Qdrant
-    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-    qdrant_key = os.getenv("QDRANT_API_KEY")
-    try:
-        storage = QdrantStorage(
-            url=qdrant_url,
-            api_key=qdrant_key,
-            collection="docs_hf",
-        )
-        storage.delete_by_source(document_id)
-        storage.delete_by_source(filename)
-    except Exception as e:
-        logger.warning(f"Could not delete vectors for document {document_id}: {e}")
-
-    # 2. Delete file from disk
-    try:
-        file_path = Path(storage_path)
-        if file_path.exists():
-            file_path.unlink()
-    except Exception as e:
-        logger.warning(f"Could not delete storage file {storage_path}: {e}")
-
-    # 3. Delete from database
-    db.delete(doc)
-    db.commit()
+    _finish_document_deletion(doc, db)
 
     return {
         "status": "deleted",
@@ -830,13 +993,13 @@ def delete_document(document_id: str, db: Session = Depends(get_db)):
     }
 
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class QueryRequestModel(BaseModel):
     question: str
     top_k: int = 5
-    workspace_id: Optional[str] = None
+    workspace_id: str = Field(min_length=1)
     document_ids: Optional[List[str]] = None
     similarity_threshold: Optional[float] = 0.0
     enable_hybrid: Optional[bool] = True
@@ -885,25 +1048,65 @@ async def query_documents(req: QueryRequestModel, db: Session = Depends(get_db))
                 detail=f"Unauthorized: document '{foreign_doc.id}' does not belong to workspace '{req.workspace_id}'.",
             )
 
+    available_document_ids = [
+        row[0]
+        for row in db.query(Document.id)
+        .filter(
+            Document.workspace_id == req.workspace_id,
+            Document.status == "completed",
+            Document.chunk_count > 0,
+        )
+        .all()
+    ]
+    if req.document_ids is not None:
+        requested_ids = set(req.document_ids)
+        available_document_ids = [
+            doc_id for doc_id in available_document_ids if doc_id in requested_ids
+        ]
+    if not available_document_ids:
+        return {
+            "answer": "Based on the provided documents in this workspace, there is insufficient relevant information to answer your question.",
+            "sources": [],
+            "citations": [],
+            "num_contexts": 0,
+            "grounded": False,
+            "insufficient_context": True,
+            "workspace_id": req.workspace_id,
+        }
+
     clamped_top_k = max(1, min(req.top_k, 20))
 
     # 3. Embedding Generation with Resilience
-    query_vec = embed_texts([clean_question])[0]
+    try:
+        query_vec = embed_texts([clean_question])[0]
+    except Exception as exc:
+        logger.error("Query embedding provider failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Query embedding is temporarily unavailable. Retry later.",
+        ) from exc
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_key = os.getenv("QDRANT_API_KEY")
     store = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
 
     # 4. Strict Hybrid Multi-Tenant Vector Search
     t_ret_start = time.perf_counter()
-    found = store.search(
-        query_vector=query_vec,
-        top_k=clamped_top_k,
-        workspace_id=req.workspace_id,
-        document_ids=req.document_ids,
-        query_text=clean_question,
-        similarity_threshold=req.similarity_threshold or 0.0,
-        enable_hybrid=req.enable_hybrid if req.enable_hybrid is not None else True,
-    )
+    try:
+        found = store.search(
+            query_vector=query_vec,
+            top_k=clamped_top_k,
+            workspace_id=req.workspace_id,
+            document_ids=available_document_ids,
+            query_text=clean_question,
+            similarity_threshold=req.similarity_threshold or 0.0,
+            enable_hybrid=req.enable_hybrid if req.enable_hybrid is not None else True,
+        )
+    except (RuntimeError, ValueError) as exc:
+        logger.error("Workspace-scoped vector search failed", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Document search is temporarily unavailable. Retry later.",
+        ) from exc
     ret_dur = round((time.perf_counter() - t_ret_start) * 1000, 2)
     telemetry.record_retrieval(len(found["contexts"]), ret_dur)
     logger.info(
@@ -1062,24 +1265,48 @@ def cleanup_workspace_data(workspace_id: str, db: Session = Depends(get_db)):
     belonging to a deleted workspace. Leaves zero orphaned vectors.
     """
     docs = db.query(Document).filter(Document.workspace_id == workspace_id).all()
+    deleted_count = len(docs)
+    for doc in docs:
+        doc.status = "deleting"
+        doc.error_message = "Workspace deletion cleanup is pending."
+        doc.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        for job in db.query(DocumentJob).filter(
+            DocumentJob.document_id == doc.id,
+            DocumentJob.status.in_(["queued", "processing", "retrying"]),
+        ):
+            job.status = "cancelled"
+            job.error_message = "Workspace deletion requested."
+            job.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    db.commit()
+
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_key = os.getenv("QDRANT_API_KEY")
     storage = QdrantStorage(url=qdrant_url, api_key=qdrant_key, collection="docs_hf")
 
     # 1. Purge all vectors for this tenant in Qdrant
-    storage.delete_by_workspace(workspace_id)
+    if not storage.delete_by_workspace(workspace_id):
+        logger.error("Could not delete workspace vectors", extra={"workspace_id": workspace_id})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Workspace cleanup is pending. Documents are unavailable; retry cleanup later.",
+        )
 
-    # 2. Delete physical storage files
-    deleted_count = len(docs)
     for doc in docs:
         try:
-            p = Path(doc.storage_path)
-            if p.exists():
-                p.unlink()
+            get_document_storage().delete(doc.storage_path)
         except Exception as e:
-            logger.warning(f"Could not remove file {doc.storage_path}: {e}")
-        db.delete(doc)
+            logger.error(
+                "Could not delete workspace document object",
+                exc_info=True,
+                extra={"workspace_id": workspace_id, "document_id": doc.id},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Workspace cleanup is pending. Documents are unavailable; retry cleanup later.",
+            ) from e
 
+    for doc in docs:
+        db.delete(doc)
     db.commit()
     return {
         "status": "deleted",

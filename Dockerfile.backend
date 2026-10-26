@@ -28,6 +28,8 @@ WORKDIR /app
 # Runtime deps for PDF handling
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the venv built in the builder stage
@@ -35,14 +37,17 @@ COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy application source
-COPY main.py data_loader.py vector_db.py custom_types.py database.py file_utils.py ./
+COPY main.py data_loader.py vector_db.py custom_types.py database.py file_utils.py storage.py telemetry_client.py ./
+COPY eval/ ./eval/
 
 # Create uploads directory (PDFs uploaded by users land here)
-RUN mkdir -p /app/uploads
+RUN mkdir -p /app/uploads /app/data
 
 # Sevalla routes HTTP traffic to the port defined by PORT env var (default 8000)
 ENV PORT=8000
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8000') + '/healthz', timeout=3)" || exit 1
 
 # Production: uvicorn serves the FastAPI app
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]

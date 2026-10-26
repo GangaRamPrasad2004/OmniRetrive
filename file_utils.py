@@ -84,11 +84,14 @@ def validate_pdf_file(
         if page_count == 0:
             return False, "PDF contains 0 pages or no readable content.", 0
 
-        # Attempt to inspect the first page to ensure streams are not corrupted
+        # Attempt to inspect the first page to ensure streams are not corrupted.
+        # Note: extract_text() returning an empty string is acceptable — it may
+        # indicate a scanned/image-only PDF, which is still a structurally valid
+        # file. Only reject the file if the call raises an exception.
         try:
             _ = reader.pages[0].extract_text()
         except Exception as e:
-            # If text extraction on first page fails completely due to corruption
+            # extract_text raised — likely a structural corruption, not a scan.
             return False, f"PDF appears corrupted or unreadable: {str(e)}", 0
 
         return True, "", page_count
@@ -97,3 +100,57 @@ def validate_pdf_file(
         return False, f"Unreadable PDF document: {str(e)}", 0
     except Exception as e:
         return False, f"Failed to validate PDF structure: {str(e)}", 0
+
+
+def validate_pdf_path(
+    filename: str,
+    path: str | os.PathLike[str],
+    max_size: int = DEFAULT_MAX_FILE_SIZE,
+) -> Tuple[bool, str, int]:
+    """Validate a staged PDF from disk without loading its full contents into memory."""
+    file_path = os.fspath(path)
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as exc:
+        return False, f"Could not read uploaded file: {exc}", 0
+
+    if file_size == 0:
+        return False, "Uploaded file is empty (0 bytes).", 0
+    if file_size > max_size:
+        actual_mb = file_size / (1024 * 1024)
+        max_mb = max_size / (1024 * 1024)
+        return False, f"File size ({actual_mb:.2f} MB) exceeds maximum allowed limit ({max_mb:.0f} MB).", 0
+
+    sanitized = sanitize_filename(filename)
+    if not sanitized.lower().endswith(".pdf"):
+        return False, f"Invalid file extension. Expected '.pdf', got '{os.path.splitext(sanitized)[1]}'.", 0
+
+    try:
+        with open(file_path, "rb") as source:
+            header = source.read(2048)
+            if b"%PDF-" not in header[:1024]:
+                return False, "Invalid PDF header: File does not contain standard '%PDF-' signature.", 0
+            kind = filetype.guess(header)
+            if kind is not None and kind.mime != "application/pdf":
+                return False, f"File content does not match PDF MIME type (detected: {kind.mime}).", 0
+
+            reader = pypdf.PdfReader(source)
+            if reader.is_encrypted:
+                try:
+                    if reader.decrypt("") == 0:
+                        return False, "Password-protected or encrypted PDFs are not supported.", 0
+                except Exception:
+                    return False, "Password-protected or encrypted PDFs are not supported.", 0
+
+            page_count = len(reader.pages)
+            if page_count == 0:
+                return False, "PDF contains 0 pages or no readable content.", 0
+            try:
+                reader.pages[0].extract_text()
+            except Exception as exc:
+                return False, f"PDF appears corrupted or unreadable: {exc}", 0
+            return True, "", page_count
+    except pypdf.errors.PdfReadError as exc:
+        return False, f"Unreadable PDF document: {exc}", 0
+    except Exception as exc:
+        return False, f"Failed to validate PDF structure: {exc}", 0

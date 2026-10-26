@@ -3,12 +3,14 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,16 +36,76 @@ func NewProxyHandler() *ProxyHandler {
 	}
 }
 
+func uploadLimitBytes() int64 {
+	limitMiB := int64(50)
+	if configured, err := strconv.ParseInt(os.Getenv("MAX_UPLOAD_SIZE_MB"), 10, 32); err == nil && configured > 0 {
+		limitMiB = configured
+	}
+	return limitMiB * 1024 * 1024
+}
+
+func (h *ProxyHandler) verifyDocumentWorkspace(
+	w http.ResponseWriter,
+	r *http.Request,
+	workspaceID string,
+	docID string,
+) bool {
+	targetURL := fmt.Sprintf("%s/documents/%s", h.AIServiceURL, url.PathEscape(docID))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
+	if err != nil {
+		jsonError(w, "Failed to construct AI document verification request", http.StatusInternalServerError)
+		return false
+	}
+
+	resp, err := h.client.Do(req)
+	if err != nil {
+		jsonError(w, "AI backend service unreachable: "+err.Error(), http.StatusBadGateway)
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+		return false
+	}
+	if resp.StatusCode != http.StatusOK {
+		jsonError(w, "AI backend failed to verify document access", http.StatusBadGateway)
+		return false
+	}
+
+	var docData struct {
+		WorkspaceID string `json:"workspace_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&docData); err != nil {
+		jsonError(w, "Invalid response from AI backend while verifying document access", http.StatusBadGateway)
+		return false
+	}
+	if docData.WorkspaceID != workspaceID {
+		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+		return false
+	}
+	return true
+}
+
 // UploadDocument proxies PDF upload to Python AI backend with verified server-side tenancy parameters
 func (h *ProxyHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 	user := middleware.GetUserFromContext(r.Context())
 	membership := middleware.GetMembershipFromContext(r.Context())
 	workspaceID := chi.URLParam(r, "workspaceId")
 
-	// Parse multipart form from incoming client request (limit: 55MB)
-	if err := r.ParseMultipartForm(55 * 1024 * 1024); err != nil {
-		jsonError(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
+	maxUpload := uploadLimitBytes()
+	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+(1<<20))
+	if err := r.ParseMultipartForm(8 * 1024 * 1024); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			jsonError(w, "Upload exceeds the configured file-size limit", http.StatusRequestEntityTooLarge)
+			return
+		}
+		jsonError(w, "Failed to parse multipart form", http.StatusBadRequest)
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 
 	file, header, err := r.FormFile("file")
@@ -53,33 +115,42 @@ func (h *ProxyHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Prepare outbound multipart request to Python backend
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	part, err := writer.CreateFormFile("file", header.Filename)
-	if err != nil {
-		jsonError(w, "Failed to create form file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if _, err := io.Copy(part, file); err != nil {
-		jsonError(w, "Failed to stream file: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Inject SERVER-VERIFIED workspace_id and owner_id
-	_ = writer.WriteField("workspace_id", workspaceID)
-	_ = writer.WriteField("owner_id", user.ID)
-	_ = writer.WriteField("member_role", string(membership.Role))
-
-	if err := writer.Close(); err != nil {
-		jsonError(w, "Failed to finalize multipart form: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
+	bodyReader, bodyWriter := io.Pipe()
+	writer := multipart.NewWriter(bodyWriter)
+	writeDone := make(chan error, 1)
+	go func() {
+		err := func() error {
+			part, err := writer.CreateFormFile("file", header.Filename)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(part, file); err != nil {
+				return err
+			}
+			if err := writer.WriteField("workspace_id", workspaceID); err != nil {
+				return err
+			}
+			if err := writer.WriteField("owner_id", user.ID); err != nil {
+				return err
+			}
+			if err := writer.WriteField("member_role", string(membership.Role)); err != nil {
+				return err
+			}
+			return writer.Close()
+		}()
+		if err != nil {
+			_ = bodyWriter.CloseWithError(err)
+		} else {
+			_ = bodyWriter.Close()
+		}
+		writeDone <- err
+	}()
 
 	targetURL := fmt.Sprintf("%s/upload", h.AIServiceURL)
-	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, body)
+	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, targetURL, bodyReader)
 	if err != nil {
+		_ = bodyReader.CloseWithError(err)
+		<-writeDone
 		jsonError(w, "Failed to construct AI service request", http.StatusInternalServerError)
 		return
 	}
@@ -87,13 +158,56 @@ func (h *ProxyHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.client.Do(outReq)
 	if err != nil {
+		_ = bodyReader.CloseWithError(err)
+		<-writeDone
 		jsonError(w, "AI backend service unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if writeErr := <-writeDone; writeErr != nil {
+		resp.Body.Close()
+		jsonError(w, "Could not stream upload to the AI backend", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// DownloadDocument streams an authorized document from the private AI storage adapter.
+func (h *ProxyHandler) DownloadDocument(w http.ResponseWriter, r *http.Request) {
+	workspaceID := chi.URLParam(r, "workspaceId")
+	docID := chi.URLParam(r, "docId")
+	if !h.verifyDocumentWorkspace(w, r, workspaceID, docID) {
+		return
+	}
+
+	targetURL := fmt.Sprintf("%s/documents/%s/download", h.AIServiceURL, url.PathEscape(docID))
+	outReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
+	if err != nil {
+		jsonError(w, "Failed to construct AI document download request", http.StatusInternalServerError)
+		return
+	}
+	resp, err := h.client.Do(outReq)
+	if err != nil {
+		jsonError(w, "AI backend service unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	w.Header().Set("Content-Type", "application/pdf")
+	if disposition := resp.Header.Get("Content-Disposition"); disposition != "" {
+		w.Header().Set("Content-Disposition", disposition)
+	}
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		w.Header().Set("Content-Length", contentLength)
+	}
+	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, resp.Body)
 }
 
@@ -171,20 +285,7 @@ func (h *ProxyHandler) RetryDocument(w http.ResponseWriter, r *http.Request) {
 	workspaceID := chi.URLParam(r, "workspaceId")
 	docID := chi.URLParam(r, "docId")
 
-	// First verify document belongs to this workspace
-	getURL := fmt.Sprintf("%s/documents/%s", h.AIServiceURL, url.PathEscape(docID))
-	getReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, getURL, nil)
-	getResp, err := h.client.Do(getReq)
-	if err != nil || getResp.StatusCode != http.StatusOK {
-		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
-		return
-	}
-	defer getResp.Body.Close()
-
-	var docData map[string]interface{}
-	_ = json.NewDecoder(getResp.Body).Decode(&docData)
-	if docData["workspace_id"] != workspaceID {
-		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+	if !h.verifyDocumentWorkspace(w, r, workspaceID, docID) {
 		return
 	}
 
@@ -213,20 +314,7 @@ func (h *ProxyHandler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify document belongs to this workspace
-	getURL := fmt.Sprintf("%s/documents/%s", h.AIServiceURL, url.PathEscape(docID))
-	getReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, getURL, nil)
-	getResp, err := h.client.Do(getReq)
-	if err != nil || getResp.StatusCode != http.StatusOK {
-		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
-		return
-	}
-	defer getResp.Body.Close()
-
-	var docData map[string]interface{}
-	_ = json.NewDecoder(getResp.Body).Decode(&docData)
-	if docData["workspace_id"] != workspaceID {
-		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+	if !h.verifyDocumentWorkspace(w, r, workspaceID, docID) {
 		return
 	}
 
@@ -249,20 +337,7 @@ func (h *ProxyHandler) CancelDocument(w http.ResponseWriter, r *http.Request) {
 	workspaceID := chi.URLParam(r, "workspaceId")
 	docID := chi.URLParam(r, "docId")
 
-	// Verify document belongs to this workspace
-	getURL := fmt.Sprintf("%s/documents/%s", h.AIServiceURL, url.PathEscape(docID))
-	getReq, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, getURL, nil)
-	getResp, err := h.client.Do(getReq)
-	if err != nil || getResp.StatusCode != http.StatusOK {
-		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
-		return
-	}
-	defer getResp.Body.Close()
-
-	var docData map[string]interface{}
-	_ = json.NewDecoder(getResp.Body).Decode(&docData)
-	if docData["workspace_id"] != workspaceID {
-		jsonError(w, "Document not found in this workspace", http.StatusNotFound)
+	if !h.verifyDocumentWorkspace(w, r, workspaceID, docID) {
 		return
 	}
 

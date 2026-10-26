@@ -82,7 +82,9 @@ class EvalRunner:
         Executes a complete evaluation benchmark across the dataset.
         Keeps evaluation strictly isolated from the production request path.
         """
-        items = dataset or load_eval_dataset()
+        items = dataset if dataset is not None else load_eval_dataset()
+        if not items:
+            raise ValueError("Evaluation dataset must contain at least one query.")
         run_id = str(uuid.uuid4())
         created_at = datetime.datetime.now(datetime.timezone.utc)
 
@@ -124,11 +126,19 @@ class EvalRunner:
             start_t = time.perf_counter()
 
             # 1. Embed query
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError(f"Evaluation query {q_id} must not be empty.")
             try:
-                query_vec = embed_texts([query])[0] if query else [0.0] * 768
-            except Exception:
-                # Graceful fallback for offline evaluation or missing provider credentials
-                query_vec = [0.0] * 768
+                query_embeddings = embed_texts([query])
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Embedding failed for evaluation query {q_id}."
+                ) from exc
+            if len(query_embeddings) != 1 or not query_embeddings[0]:
+                raise RuntimeError(
+                    f"Embedding provider returned no usable vector for evaluation query {q_id}."
+                )
+            query_vec = query_embeddings[0]
 
             # 2. Search
             search_res = self.storage.search(

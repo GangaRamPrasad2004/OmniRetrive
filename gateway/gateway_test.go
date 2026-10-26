@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"omniretrive/gateway/db"
 	"omniretrive/gateway/models"
@@ -22,7 +24,7 @@ func setupTestDB(t *testing.T) (*db.DB, func()) {
 	}
 
 	dbPath := filepath.Join(tempDir, "test_gateway.db")
-	database, err := db.InitDB(dbPath)
+	database, err := db.InitDB("sqlite://" + dbPath)
 	if err != nil {
 		t.Fatalf("failed to init test db: %v", err)
 	}
@@ -135,12 +137,102 @@ func TestAuth_RegisterAndLogin(t *testing.T) {
 	}
 }
 
+func TestProtectedWorkspaceRoutesRequireAuthentication(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+	router := SetupRouter(database)
+
+	for _, path := range []string{
+		"/api/workspaces",
+		"/api/workspaces/workspace-id/documents",
+		"/api/workspaces/workspace-id/query",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if path == "/api/workspaces/workspace-id/query" {
+			req.Method = http.MethodPost
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s without a bearer token: expected status 401, got %d", path, w.Code)
+		}
+	}
+}
+
+func TestDocumentActionsReportAIServiceErrorsDuringWorkspaceVerification(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	aiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer aiServer.Close()
+
+	t.Setenv("AI_SERVICE_URL", aiServer.URL)
+	router := SetupRouter(database)
+	token, _, workspace := registerUser(t, router, "actions@example.com", "Password123!", "Workspace Owner")
+
+	requests := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, fmt.Sprintf("/api/workspaces/%s/documents/doc-1/retry", workspace.ID)},
+		{http.MethodPost, fmt.Sprintf("/api/workspaces/%s/documents/doc-1/cancel", workspace.ID)},
+		{http.MethodDelete, fmt.Sprintf("/api/workspaces/%s/documents/doc-1", workspace.ID)},
+	}
+	for _, testCase := range requests {
+		req := httptest.NewRequest(testCase.method, testCase.path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+
+		if recorder.Code != http.StatusBadGateway {
+			t.Errorf("%s %s: expected status 502 for AI backend error, got %d",
+				testCase.method, testCase.path, recorder.Code)
+		}
+	}
+}
+
+func TestRegistrationRollsBackUserWhenWorkspaceProvisioningFails(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+	user := &models.User{
+		ID:           "user-rollback",
+		Email:        "rollback@example.com",
+		PasswordHash: "hash",
+		FullName:     "Rollback User",
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	workspace := &models.Workspace{
+		ID:        "workspace-rollback",
+		Name:      "Invalid owner reference",
+		OwnerID:   "missing-user",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := database.CreateUserWithWorkspace(user, workspace, "membership-rollback"); err == nil {
+		t.Fatal("expected workspace foreign key failure")
+	}
+	if _, err := database.GetUserByID(user.ID); err == nil {
+		t.Fatal("user insert should roll back with failed workspace provisioning")
+	}
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 2. WORKSPACE CREATION, MEMBERSHIP & RBAC TESTS
 // ─────────────────────────────────────────────────────────────────────────────
 func TestWorkspaces_RBAC_Roles(t *testing.T) {
 	database, cleanup := setupTestDB(t)
 	defer cleanup()
+	cleanupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cleanupServer.Close()
+	t.Setenv("AI_SERVICE_URL", cleanupServer.URL)
 	router := SetupRouter(database)
 
 	aliceToken, _, _ := registerUser(t, router, "alice@acme.com", "Password123!", "Alice (Owner)")
@@ -203,6 +295,30 @@ func TestWorkspaces_RBAC_Roles(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected owner workspace deletion to succeed 200, got %d", w.Code)
+	}
+}
+
+func TestDeleteWorkspaceKeepsWorkspaceWhenAICleanupFails(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+	cleanupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "cleanup failed", http.StatusInternalServerError)
+	}))
+	defer cleanupServer.Close()
+	t.Setenv("AI_SERVICE_URL", cleanupServer.URL)
+	router := SetupRouter(database)
+
+	token, _, workspace := registerUser(t, router, "cleanup@example.com", "Password123!", "Cleanup")
+	req := httptest.NewRequest(http.MethodDelete, "/api/workspaces/"+workspace.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("expected cleanup failure response 502, got %d: %s", response.Code, response.Body.String())
+	}
+	if _, err := database.GetWorkspaceByID(workspace.ID); err != nil {
+		t.Fatalf("workspace should remain when AI data cleanup fails: %v", err)
 	}
 }
 
@@ -270,7 +386,6 @@ func TestMultiTenant_CrossWorkspaceIsolation(t *testing.T) {
 	}
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. RATE LIMITING TESTS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,5 +417,54 @@ func TestRateLimiter_Exceeded(t *testing.T) {
 
 	if !rateLimited {
 		t.Errorf("expected rate limiter to trigger HTTP 429 after rapid requests, completed %d requests without rate limit", hitCount)
+	}
+}
+
+func TestUploadRateLimiter_Exceeded(t *testing.T) {
+	database, cleanup := setupTestDB(t)
+	defer cleanup()
+	aiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer aiServer.Close()
+	t.Setenv("AI_SERVICE_URL", aiServer.URL)
+	router := SetupRouter(database)
+
+	token, _, workspace := registerUser(t, router, "upload-limit@example.com", "Password123!", "Upload Limit")
+	limited := false
+	for range 8 {
+		body := &bytes.Buffer{}
+		writer := multipart.NewWriter(body)
+		part, err := writer.CreateFormFile("file", "test.pdf")
+		if err != nil {
+			t.Fatalf("create upload form file: %v", err)
+		}
+		if _, err := part.Write([]byte("%PDF-1.4 test")); err != nil {
+			t.Fatalf("write upload fixture: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("close upload form: %v", err)
+		}
+
+		req := httptest.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf("/api/workspaces/%s/documents/upload", workspace.ID),
+			body,
+		)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.RemoteAddr = "192.0.2.10:12345"
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		if response.Code == http.StatusTooManyRequests {
+			limited = true
+			break
+		}
+		if response.Code != http.StatusCreated {
+			t.Fatalf("expected upload proxy success before limit, got %d: %s", response.Code, response.Body.String())
+		}
+	}
+	if !limited {
+		t.Fatal("expected upload rate limiter to return HTTP 429")
 	}
 }

@@ -10,6 +10,7 @@ from qdrant_client.models import (
     MatchValue,
     MatchAny,
     FilterSelector,
+    PayloadSchemaType,
 )
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter, before_sleep_log
 import re
@@ -61,6 +62,14 @@ class QdrantStorage:
                 self.client.create_collection(
                     collection_name=self.collection,
                     vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                )
+            for field_name in ("workspace_id", "document_id", "document_version"):
+                self.client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD
+                    if field_name != "document_version"
+                    else PayloadSchemaType.INTEGER,
                 )
         except Exception as e:
             logger.warning(f"Could not connect or initialize Qdrant collection '{collection}': {e}")
@@ -118,11 +127,13 @@ class QdrantStorage:
         Performs vector search in Qdrant with tenant isolation, document filtering,
         hybrid BM25/keyword re-ranking, and near-identical passage deduplication.
         """
+        if not workspace_id or not workspace_id.strip():
+            raise ValueError("workspace_id is required for tenant-scoped vector search.")
+
         must_conditions = []
-        if workspace_id:
-            must_conditions.append(
-                FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
-            )
+        must_conditions.append(
+            FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))
+        )
         if document_ids:
             if len(document_ids) == 1:
                 must_conditions.append(
@@ -146,7 +157,7 @@ class QdrantStorage:
             )
         except Exception as e:
             logger.error(f"Vector search failed: {e}")
-            return {"contexts": [], "sources": [], "citations": []}
+            raise RuntimeError("Vector search is unavailable.") from e
 
         candidates = []
         points = getattr(results, "points", []) or []

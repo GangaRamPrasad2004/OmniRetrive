@@ -17,6 +17,15 @@ dependencies = [
     "qdrant-client>=1.18.0",
     "requests>=2.34.2",
     "sqlalchemy>=2.0.51",
-    "streamlit>=1.58.0",
     "uvicorn>=0.49.0",
+    "pytesseract>=0.3.13",
+    "pdf2image>=1.17.0",
+    "pillow>=12.3.0",
+    "boto3>=1.38.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5",
+    "ruff>=0.11.0",
 ]

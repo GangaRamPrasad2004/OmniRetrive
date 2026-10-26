@@ -13,3 +13,4 @@ wheels/
 # Runtime data (never commit uploads or local vector DB)
 uploads/
 qdrant_storage/
+backups/

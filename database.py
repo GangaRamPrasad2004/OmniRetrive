@@ -13,6 +13,8 @@ from sqlalchemy import (
     ForeignKey,
     desc,
     asc,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 
@@ -28,6 +30,7 @@ class Document(Base):
     mime_type = Column(String(100), default="application/pdf")
     storage_path = Column(String(500), nullable=False)
     owner_id = Column(String(100), default="default_user", index=True)
+    uploaded_by = Column(String(100), nullable=True, index=True)
     workspace_id = Column(String(100), default="default_workspace", index=True)
     version = Column(Integer, default=1)
     status = Column(String(50), default="queued", index=True)  # queued, processing, completed, failed, retrying
@@ -36,6 +39,7 @@ class Document(Base):
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), index=True)
     updated_at = Column(DateTime, default=lambda: datetime.datetime.now(datetime.timezone.utc), onupdate=lambda: datetime.datetime.now(datetime.timezone.utc))
+    last_processed_at = Column(DateTime, nullable=True)
 
     jobs = relationship("DocumentJob", back_populates="document", cascade="all, delete-orphan")
 
@@ -46,8 +50,8 @@ class Document(Base):
             "file_hash": self.file_hash,
             "file_size": self.file_size,
             "mime_type": self.mime_type,
-            "storage_path": self.storage_path,
             "owner_id": self.owner_id,
+            "uploaded_by": self.uploaded_by or self.owner_id,
             "workspace_id": self.workspace_id,
             "version": self.version,
             "status": self.status,
@@ -56,6 +60,7 @@ class Document(Base):
             "error_message": self.error_message,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "last_processed_at": self.last_processed_at.isoformat() if self.last_processed_at else None,
             "is_ready_for_qa": (self.status == "completed" and self.chunk_count > 0),
         }
 
@@ -239,6 +244,18 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    inspector = inspect(engine)
+    document_columns = {column["name"] for column in inspector.get_columns("documents")}
+    additions = []
+    if "uploaded_by" not in document_columns:
+        additions.append("ADD COLUMN uploaded_by VARCHAR(100)")
+    if "last_processed_at" not in document_columns:
+        timestamp_type = "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME"
+        additions.append(f"ADD COLUMN last_processed_at {timestamp_type}")
+    if additions:
+        with engine.begin() as connection:
+            for addition in additions:
+                connection.execute(text(f"ALTER TABLE documents {addition}"))
 
 
 def get_db():

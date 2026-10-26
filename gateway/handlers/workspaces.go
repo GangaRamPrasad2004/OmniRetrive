@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -241,10 +242,23 @@ func (h *WorkspaceHandler) DeleteWorkspace(w http.ResponseWriter, r *http.Reques
 	}
 
 	// Cascade cleanup of derived vector data and documents in Python AI service
-	cleanupURL := fmt.Sprintf("%s/workspaces/%s/cleanup", h.AIServe, workspaceID)
-	reqCleanup, _ := http.NewRequest(http.MethodDelete, cleanupURL, nil)
+	cleanupURL := fmt.Sprintf("%s/workspaces/%s/cleanup", h.AIServe, url.PathEscape(workspaceID))
+	reqCleanup, err := http.NewRequestWithContext(r.Context(), http.MethodDelete, cleanupURL, nil)
+	if err != nil {
+		jsonError(w, "Failed to construct workspace cleanup request", http.StatusInternalServerError)
+		return
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
-	_, _ = client.Do(reqCleanup)
+	cleanupResponse, err := client.Do(reqCleanup)
+	if err != nil {
+		jsonError(w, "Workspace data cleanup service is unavailable; workspace was not deleted", http.StatusBadGateway)
+		return
+	}
+	defer cleanupResponse.Body.Close()
+	if cleanupResponse.StatusCode < http.StatusOK || cleanupResponse.StatusCode >= http.StatusMultipleChoices {
+		jsonError(w, "Workspace data cleanup failed; workspace was not deleted", http.StatusBadGateway)
+		return
+	}
 
 	// Delete from Gateway DB (cascades memberships)
 	if err := h.DB.DeleteWorkspace(workspaceID); err != nil {

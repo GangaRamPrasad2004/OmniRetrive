@@ -1,7 +1,9 @@
 import os
 import logging
+import re
 from pathlib import Path
-from typing import List, Generator, Optional, Dict, Any
+from typing import List, Optional
+
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 from llama_index.readers.file import PDFReader
@@ -17,6 +19,22 @@ from tenacity import (
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# OCR availability check — performed once at module load time.
+# Tesseract binary may not be installed; we degrade gracefully.
+# ---------------------------------------------------------------------------
+try:
+    import pytesseract
+    pytesseract.get_tesseract_version()  # raises TesseractNotFoundError if absent
+    OCR_AVAILABLE = True
+    logger.info("Tesseract binary detected — OCR fallback enabled.")
+except Exception:
+    OCR_AVAILABLE = False
+    logger.info("Tesseract binary not found — OCR fallback disabled.")
+
+# ---------------------------------------------------------------------------
+# HuggingFace embedding client
+# ---------------------------------------------------------------------------
 _hf_token = os.getenv("HF_TOKEN")
 hf_client = InferenceClient(
     model="BAAI/bge-base-en-v1.5",
@@ -26,6 +44,23 @@ hf_client = InferenceClient(
 
 splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
 
+# ---------------------------------------------------------------------------
+# Threshold: pages whose extracted text is shorter than this are considered
+# scanned / image-only pages with no meaningful selectable text.
+# ---------------------------------------------------------------------------
+_SCANNED_PAGE_CHAR_THRESHOLD = 50
+
+
+# ---------------------------------------------------------------------------
+# Custom exception
+# ---------------------------------------------------------------------------
+class ExtractionError(Exception):
+    """Raised when PDF text extraction fails at the document level."""
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def is_transient_error(exc: BaseException) -> bool:
     """
@@ -51,9 +86,6 @@ def is_transient_error(exc: BaseException) -> bool:
     return any(indicator in err_str for indicator in transient_indicators)
 
 
-import re
-
-
 def _extract_heading(text: str) -> Optional[str]:
     """Extracts markdown heading or uppercase section title from the beginning of a chunk/page."""
     lines = text.strip().split("\n")
@@ -66,6 +98,19 @@ def _extract_heading(text: str) -> Optional[str]:
         if len(clean) < 80 and (clean.isupper() or clean.endswith(":")):
             return clean.rstrip(":")
     return None
+
+
+def _strip_outer_blank_lines(text: str) -> str:
+    """Strip leading/trailing blank lines but preserve internal whitespace (tables, indentation)."""
+    lines = text.split("\n")
+    # Find first and last non-blank line
+    start = 0
+    while start < len(lines) and not lines[start].strip():
+        start += 1
+    end = len(lines) - 1
+    while end >= start and not lines[end].strip():
+        end -= 1
+    return "\n".join(lines[start : end + 1])
 
 
 def deduplicate_chunks(chunks_with_meta: List[dict], threshold: float = 0.75) -> List[dict]:
@@ -99,45 +144,91 @@ def deduplicate_chunks(chunks_with_meta: List[dict], threshold: float = 0.75) ->
     return unique
 
 
-def load_and_chunk_pdf_with_metadata(path: str) -> List[dict]:
+def _ocr_page(image) -> str:
+    """Run Tesseract OCR on a single PIL image. Returns extracted text."""
+    import pytesseract
+    return pytesseract.image_to_string(image)
+
+
+# ---------------------------------------------------------------------------
+# Main extraction pipeline
+# ---------------------------------------------------------------------------
+
+def load_and_chunk_pdf_with_metadata(
+    path: str,
+    max_pages: Optional[int] = None,
+) -> List[dict]:
     """
-    Memory-efficient PDF text extraction, heading detection, and chunking with page tracking.
-    Processes pages incrementally to prevent memory exhaustion on large documents.
+    Smart OCR-fallback PDF extraction pipeline.
+
+    1. Text-first extraction via LlamaIndex PDFReader.
+    2. Scanned-page detection: pages with < 50 chars are considered image-only.
+    3. OCR fallback (Tesseract) for scanned pages when OCR_AVAILABLE is True.
+    4. Graceful degradation with placeholder chunks when OCR is unavailable.
+    5. Partial-extraction reporting: warns when > 20% pages are empty.
+    6. Large document streaming: existing incremental processing kept;
+       optional max_pages safety cap.
+
+    Args:
+        path: Absolute or relative path to the PDF file.
+        max_pages: If set, only process the first N pages.
+
+    Returns:
+        List of chunk dicts with keys:
+            text, page_number, heading, chunk_index,
+            ocr_fallback, ocr_attempted, extraction_method
     """
     file_path = Path(path)
     if not file_path.exists():
         raise FileNotFoundError(f"PDF file not found at: {path}")
 
+    # --- Load PDF ---
     try:
         reader = PDFReader()
         docs = reader.load_data(file=file_path)
     except Exception as e:
         logger.error(f"Failed to read PDF at {path}: {e}")
-        raise RuntimeError(f"PDF text extraction failed: {e}") from e
+        raise ExtractionError(f"PDF text extraction failed for '{path}': {e}") from e
 
     if not docs:
         logger.warning(f"No pages or extractable data in PDF: {path}")
         return []
 
+    # Apply max_pages cap
+    if max_pages is not None:
+        docs = docs[:max_pages]
+
+    # --- Per-document stats ---
+    pages_total = len(docs)
+    pages_text_extracted = 0
+    pages_ocr_fallback = 0
+    pages_empty = 0
+
     chunks_with_meta: List[dict] = []
-    current_heading = None
+    current_heading: Optional[str] = None
 
     for page_idx, page_doc in enumerate(docs, start=1):
-        page_text = getattr(page_doc, "text", "")
+        page_text = getattr(page_doc, "text", "") or ""
         page_num = page_idx
         if hasattr(page_doc, "metadata") and page_doc.metadata:
             label = page_doc.metadata.get("page_label")
             if label and str(label).isdigit():
                 page_num = int(label)
 
-        if page_text and page_text.strip():
+        is_scanned = len(page_text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD
+
+        # --- Path 1: Page has usable text ---
+        if not is_scanned:
+            pages_text_extracted += 1
             detected_heading = _extract_heading(page_text)
             if detected_heading:
                 current_heading = detected_heading
 
-            page_chunks = splitter.split_text(page_text.strip())
+            # Preserve internal whitespace; only strip outer blank lines
+            cleaned_page = _strip_outer_blank_lines(page_text)
+            page_chunks = splitter.split_text(cleaned_page)
             for chunk_str in page_chunks:
-                clean_chunk = chunk_str.strip()
+                clean_chunk = _strip_outer_blank_lines(chunk_str)
                 if not clean_chunk:
                     continue
                 chunk_heading = _extract_heading(clean_chunk) or current_heading
@@ -146,9 +237,80 @@ def load_and_chunk_pdf_with_metadata(path: str) -> List[dict]:
                     "page_number": page_num,
                     "heading": chunk_heading,
                     "chunk_index": len(chunks_with_meta),
+                    "ocr_fallback": False,
+                    "ocr_attempted": False,
+                    "extraction_method": "text",
                 })
+            continue
 
-    # Near-identical chunk deduplication (boilerplate, repeated headers/footers)
+        # --- Path 2: Scanned page — attempt OCR if available ---
+        if OCR_AVAILABLE:
+            try:
+                import pdf2image
+                images = pdf2image.convert_from_path(str(file_path), first_page=page_idx, last_page=page_idx)
+                if images:
+                    ocr_text = _ocr_page(images[0])
+                    ocr_text_clean = _strip_outer_blank_lines(ocr_text)
+                    if ocr_text_clean:
+                        pages_ocr_fallback += 1
+                        detected_heading = _extract_heading(ocr_text_clean)
+                        if detected_heading:
+                            current_heading = detected_heading
+                        ocr_chunks = splitter.split_text(ocr_text_clean)
+                        for chunk_str in ocr_chunks:
+                            clean_chunk = _strip_outer_blank_lines(chunk_str)
+                            if not clean_chunk:
+                                continue
+                            chunk_heading = _extract_heading(clean_chunk) or current_heading
+                            chunks_with_meta.append({
+                                "text": clean_chunk,
+                                "page_number": page_num,
+                                "heading": chunk_heading,
+                                "chunk_index": len(chunks_with_meta),
+                                "ocr_fallback": True,
+                                "ocr_attempted": True,
+                                "extraction_method": "ocr",
+                            })
+                        continue
+                    # OCR produced no usable text — fall through to placeholder
+            except Exception as ocr_err:
+                logger.warning(f"OCR failed on page {page_num} of '{path}': {ocr_err}")
+            # OCR tried but produced nothing useful
+            pages_empty += 1
+            chunks_with_meta.append({
+                "text": f"[Page {page_num}: No extractable text. OCR produced no output.]",
+                "page_number": page_num,
+                "heading": None,
+                "chunk_index": len(chunks_with_meta),
+                "ocr_fallback": False,
+                "ocr_attempted": True,
+                "extraction_method": "none",
+            })
+        else:
+            # --- Path 3: OCR unavailable — placeholder ---
+            pages_empty += 1
+            chunks_with_meta.append({
+                "text": f"[Page {page_num}: No extractable text. OCR unavailable.]",
+                "page_number": page_num,
+                "heading": None,
+                "chunk_index": len(chunks_with_meta),
+                "ocr_fallback": False,
+                "ocr_attempted": False,
+                "extraction_method": "none",
+            })
+
+    # --- Partial extraction reporting ---
+    if pages_total > 0:
+        empty_ratio = pages_empty / pages_total
+        if empty_ratio > 0.20:
+            logger.warning(
+                f"Partial extraction warning for '{path}': "
+                f"{pages_empty}/{pages_total} pages ({empty_ratio:.0%}) yielded no text. "
+                f"pages_text_extracted={pages_text_extracted}, "
+                f"pages_ocr_fallback={pages_ocr_fallback}."
+            )
+
+    # Near-identical chunk deduplication
     return deduplicate_chunks(chunks_with_meta)
 
 
@@ -159,6 +321,69 @@ def load_and_chunk_pdf(path: str) -> List[str]:
     rich_chunks = load_and_chunk_pdf_with_metadata(path)
     return [c["text"] for c in rich_chunks]
 
+
+# ---------------------------------------------------------------------------
+# Quality detection (no OCR, fast scan)
+# ---------------------------------------------------------------------------
+
+def detect_extraction_quality(path: str) -> dict:
+    """
+    Quickly scans the PDF using text extraction only and reports extraction
+    quality metrics without performing OCR.
+
+    Returns:
+        {
+          "pages_total": int,
+          "pages_with_text": int,
+          "pages_scanned": int,   # pages with < 50 chars of extracted text
+          "ocr_recommended": bool,  # True if > 30% of pages are scanned
+          "ocr_available": bool,
+          "file_size_bytes": int,
+        }
+    """
+    file_path = Path(path)
+    file_size = file_path.stat().st_size if file_path.exists() else 0
+
+    try:
+        reader = PDFReader()
+        docs = reader.load_data(file=file_path)
+    except Exception as e:
+        logger.error(f"detect_extraction_quality: failed to read '{path}': {e}")
+        return {
+            "pages_total": 0,
+            "pages_with_text": 0,
+            "pages_scanned": 0,
+            "ocr_recommended": False,
+            "ocr_available": OCR_AVAILABLE,
+            "file_size_bytes": file_size,
+        }
+
+    pages_total = len(docs)
+    pages_scanned = 0
+    pages_with_text = 0
+
+    for page_doc in docs:
+        page_text = getattr(page_doc, "text", "") or ""
+        if len(page_text.strip()) < _SCANNED_PAGE_CHAR_THRESHOLD:
+            pages_scanned += 1
+        else:
+            pages_with_text += 1
+
+    ocr_recommended = (pages_total > 0) and (pages_scanned / pages_total) > 0.30
+
+    return {
+        "pages_total": pages_total,
+        "pages_with_text": pages_with_text,
+        "pages_scanned": pages_scanned,
+        "ocr_recommended": ocr_recommended,
+        "ocr_available": OCR_AVAILABLE,
+        "file_size_bytes": file_size,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Embedding pipeline (unchanged signatures)
+# ---------------------------------------------------------------------------
 
 @retry(
     stop=stop_after_attempt(5),

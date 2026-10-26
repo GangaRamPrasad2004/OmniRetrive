@@ -19,6 +19,21 @@ def rag_test_env(tmp_path):
     )
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
+    db = TestingSessionLocal()
+    db.add(
+        Document(
+            id="rag-test-document",
+            filename="rag-test.pdf",
+            file_hash="rag-test-hash",
+            file_size=1,
+            storage_path="workspaces/ws-1/documents/rag-test-document/versions/1/original.pdf",
+            workspace_id="ws-1",
+            status="completed",
+            chunk_count=1,
+        )
+    )
+    db.commit()
+    db.close()
 
     def override_get_db():
         db = TestingSessionLocal()
@@ -40,6 +55,11 @@ def rag_test_env(tmp_path):
 # 1. QUERY VALIDATION & BOUNDARY CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 class TestQueryValidation:
+    def test_workspace_is_required(self, rag_test_env):
+        client, _, _ = rag_test_env
+        response = client.post("/query", json={"question": "What is in the documents?"})
+        assert response.status_code == 422
+
     def test_empty_query_rejected(self, rag_test_env):
         client, _, _ = rag_test_env
         resp = client.post("/query", json={"question": "   ", "workspace_id": "ws-1"})
